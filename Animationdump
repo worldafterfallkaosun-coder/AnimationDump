@@ -1,218 +1,32 @@
 --[[
-	Animation Dumper -> .rbxmx  (Roblox / Delta)
+	Animation ID Dumper  (Roblox / Delta)
 
-	Narik KeyframeSequence lengkap (keyframe, pose, CFrame, easing, weight,
-	marker, loop, priority, hip height) dan nulis ke file model Roblox
-	(.rbxmx, XML) yang bisa langsung di-drag ke Studio, sama kayak Reel.rbxm.
+	Ngumpulin semua ID animasi yang ketemu di game. CUMA ID-nya:
+	ga narik keyframe, ga bikin .rbxm / .rbxmx.
 
 	Sumber ID:
 	  - semua instance Animation (termasuk yang dibikin runtime & nil instances)
 	  - animasi yang lagi/pernah diputar (player + NPC)
 
-	Nama animasi:
-	  Nama asli diambil dari katalog Roblox (MarketplaceService:GetProductInfo),
-	  jadi file-nya jadi "Zombie_Run_123456789.rbxmx", bukan "Animation_123456789".
-	  Urutan: nama asset di katalog -> nama instance/track di game -> "Animation".
-	  Nama generik ("Animation", "?", kosong) dianggap bukan nama asli.
-
-	Format ID:
-	  Semua ID ditampilin dan disimpan dalam bentuk rbxassetid://<id>
-	  (GUI, tombol COPY, _ids.txt, _failed.txt, dan objek Animation di dalam
-	  .rbxmx dengan AnimationId = rbxassetid://<id>).
-	  dump()/AnimRip.name() nerima "123", 123, atau "rbxassetid://123".
-
-	Output: workspace/AnimDump/<nama>_<id>.rbxmx
-	        workspace/AnimDump/_ALL.rbxmx   (semua jadi satu file, DUMP ALL)
-	        workspace/AnimDump/_ids.txt     (rbxassetid://<id> | nama | sumber)
-	        workspace/AnimDump/_failed.txt  (rbxassetid://<id> yang gagal ditarik)
+	Output: workspace/AnimDump/ids.txt         -> rbxassetid://<id>, satu per baris
+	        workspace/AnimDump/ids_detail.txt  -> <id> | <nama> | <sumber>
+	(DUMP ALL juga nyalin ids.txt ke clipboard kalau executor support)
 
 	API:
-	  getgenv().AnimRip.dump("123456789")      -> dump 1 id
-	  getgenv().AnimRip.dumpAll()              -> dump semua yang ketemu
-	  getgenv().AnimRip.name("123456789")      -> nama asli (yield)
-	  getgenv().AnimRip.assetId("123456789")   -> "rbxassetid://123456789"
-	  getgenv().AnimRip.list                   -> daftar entry {id,name,source}
+	  getgenv().AnimRip.dumpAll()  -> tulis file + copy clipboard
+	  getgenv().AnimRip.ids()      -> string "rbxassetid://..." (satu per baris)
+	  getgenv().AnimRip.list       -> daftar entry {id, name, source}
 	  getgenv().AnimRip.destroy()
 ]]
 
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local KSP = game:GetService("KeyframeSequenceProvider")
-local MPS = game:GetService("MarketplaceService")
 local lp = Players.LocalPlayer
 
 local FOLDER = "AnimDump"
 local POLL_INTERVAL = 0.5
 local MAX_ROWS = 300 -- batas baris GUI (DUMP ALL tetap ngitung semuanya)
-local INCLUDE_ANIMATION_REF = true -- taruh objek Animation (AnimationId = rbxassetid://id) di samping tiap KeyframeSequence di .rbxmx
-local NAME_RETRIES = 3 -- percobaan GetProductInfo per id
-local NAME_DELAY = 0.15 -- jeda antar request nama di GUI (biar ga kena rate limit)
-
---[[PURE-BEGIN]]
--- Bagian murni (tanpa API Roblox): tabel data -> XML model Roblox.
--- data = {
---   Loop=bool, Priority=int, HipHeight=number?,
---   Keyframes = { {Time=n, Name=s, Poses={pose...}, Markers={{Name=,Value=}}} }
--- }
--- pose = {Name, CFrame={x,y,z,r00..r22}, EasingStyle=int, EasingDirection=int, Weight, Children={pose...}}
-local function esc(s)
-	s = tostring(s)
-	s = s:gsub("&", "&amp;")
-	s = s:gsub("<", "&lt;")
-	s = s:gsub(">", "&gt;")
-	s = s:gsub('"', "&quot;")
-	s = s:gsub("[\1-\8\11\12\14-\31]", "")
-	return s
-end
-
-local function num(n)
-	n = tonumber(n) or 0
-	if n ~= n or n == math.huge or n == -math.huge then
-		return "0"
-	end
-	return string.format("%.9g", n)
-end
-
-local CF_KEYS = { "X", "Y", "Z", "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22" }
-
-local function toXML(list)
-	local out = {
-		'<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">',
-	}
-	local ref = 0
-
-	local function put(s)
-		out[#out + 1] = s
-	end
-
-	local function open(class, name)
-		ref = ref + 1
-		put('<Item class="' .. class .. '" referent="RBX' .. ref .. '">')
-		put("<Properties>")
-		put('<string name="Name">' .. esc(name) .. "</string>")
-	end
-
-	local function emitPose(p)
-		open("Pose", p.Name)
-		local c = p.CFrame or {}
-		put('<CoordinateFrame name="CFrame">')
-		for i = 1, 12 do
-			local default = (i == 4 or i == 8 or i == 12) and 1 or 0 -- identity kalau data kosong
-			put("<" .. CF_KEYS[i] .. ">" .. num(c[i] or default) .. "</" .. CF_KEYS[i] .. ">")
-		end
-		put("</CoordinateFrame>")
-		put('<token name="EasingDirection">' .. num(p.EasingDirection) .. "</token>")
-		put('<token name="EasingStyle">' .. num(p.EasingStyle) .. "</token>")
-		put('<float name="Weight">' .. num(p.Weight == nil and 1 or p.Weight) .. "</float>")
-		put("</Properties>")
-		for _, child in ipairs(p.Children or {}) do
-			emitPose(child)
-		end
-		put("</Item>")
-	end
-
-	for _, item in ipairs(list) do
-		local data = item.data
-		-- item.assetId (mis. "rbxassetid://123") -> objek Animation di samping KeyframeSequence
-		if item.assetId then
-			open("Animation", item.name)
-			put('<Content name="AnimationId"><url>' .. esc(item.assetId) .. "</url></Content>")
-			put("</Properties>")
-			put("</Item>")
-		end
-		open("KeyframeSequence", item.name)
-		put('<bool name="Loop">' .. (data.Loop and "true" or "false") .. "</bool>")
-		put('<token name="Priority">' .. num(data.Priority) .. "</token>")
-		if data.HipHeight then
-			put('<float name="AuthoredHipHeight">' .. num(data.HipHeight) .. "</float>")
-		end
-		put("</Properties>")
-		for _, kf in ipairs(data.Keyframes) do
-			open("Keyframe", kf.Name or "Keyframe")
-			put('<float name="Time">' .. num(kf.Time) .. "</float>")
-			put("</Properties>")
-			for _, p in ipairs(kf.Poses or {}) do
-				emitPose(p)
-			end
-			for _, m in ipairs(kf.Markers or {}) do
-				open("KeyframeMarker", m.Name)
-				put('<string name="Value">' .. esc(m.Value or "") .. "</string>")
-				put("</Properties>")
-				put("</Item>")
-			end
-			put("</Item>")
-		end
-		put("</Item>")
-	end
-
-	put("</roblox>")
-	return table.concat(out, "\n")
-end
-
--- "123" / 123 / "rbxassetid://123" / "http://www.roblox.com/asset/?id=123" -> "123"
-local function parseId(raw)
-	local id = tostring(raw or ""):match("%d+")
-	if not id or id:match("^0+$") then
-		return nil
-	end
-	return id
-end
-
--- "123" -> "rbxassetid://123"
-local function assetUrl(id)
-	return "rbxassetid://" .. tostring(id)
-end
-
-local function trim(s)
-	return (tostring(s or ""):match("^%s*(.-)%s*$"))
-end
-
--- nama generik = bukan nama asli ("Animation", "Animation3", "?", kosong, angka doang)
-local GENERIC = { [""] = true, ["?"] = true, anim = true, keyframesequence = true, unnamed = true, untitled = true }
-local function isGenericName(n)
-	if type(n) ~= "string" then
-		return true
-	end
-	local k = (n:gsub("%s+", "")):lower()
-	return GENERIC[k] == true or k:match("^animation%d*$") ~= nil or k:match("^%d+$") ~= nil
-end
-
--- pilih nama terbaik: nama asset katalog > nama instance/track > "Animation"
-local function pickName(assetName, instName)
-	if not isGenericName(assetName) then
-		return trim(assetName)
-	end
-	if not isGenericName(instName) then
-		return trim(instName)
-	end
-	-- dua-duanya generik: pakai yang ada isinya, kalau ga ada ya "Animation"
-	local a, i = trim(assetName), trim(instName)
-	if a ~= "" and a ~= "?" then
-		return a
-	end
-	if i ~= "" and i ~= "?" then
-		return i
-	end
-	return "Animation"
-end
-
--- nama -> aman buat nama file (ASCII, tanpa spasi/simbol)
-local function safeName(s)
-	s = tostring(s or "Animation")
-	s = s:gsub("[^%w_%-]+", "_")
-	s = s:gsub("_+", "_")
-	s = s:gsub("^_+", "")
-	s = s:gsub("_+$", "")
-	if #s > 60 then
-		s = s:sub(1, 60)
-		s = s:gsub("_+$", "")
-	end
-	if s == "" then
-		s = "Animation"
-	end
-	return s
-end
---[[PURE-END]]
 
 ----------------------------------------------------------------
 -- Setup
@@ -223,6 +37,7 @@ if env.AnimRip and env.AnimRip.destroy then
 end
 
 local canWrite = type(writefile) == "function"
+local canClip = type(setclipboard) == "function"
 if canWrite and type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(FOLDER) then
 	pcall(makefolder, FOLDER)
 end
@@ -232,7 +47,6 @@ local conns = {}
 local found = {} -- id -> entry
 local order = {} -- urutan ketemu
 local animators = {}
-local cache = {}
 local currentTrack
 local rowCount = 0
 local addRow, setStatus, setCount -- diisi di bagian UI
@@ -243,54 +57,72 @@ local function keep(c)
 end
 
 ----------------------------------------------------------------
--- Roblox -> tabel data
+-- Dump ID
 ----------------------------------------------------------------
-local function readPose(pose)
-	local e = {
-		Name = pose.Name,
-		CFrame = { pose.CFrame:GetComponents() },
-		EasingStyle = pose.EasingStyle.Value,
-		EasingDirection = pose.EasingDirection.Value,
-		Weight = pose.Weight,
-		Children = {},
-	}
-	for _, sub in ipairs(pose:GetChildren()) do
-		if sub:IsA("Pose") then
-			e.Children[#e.Children + 1] = readPose(sub)
-		end
-	end
-	return e
+local function assetUrl(id)
+	return "rbxassetid://" .. id
 end
 
-local function readSequence(ks)
-	local data = {
-		Loop = ks.Loop,
-		Priority = ks.Priority.Value,
-		Keyframes = {},
-	}
-	pcall(function()
-		data.HipHeight = ks.AuthoredHipHeight
-	end)
-	for _, kf in ipairs(ks:GetKeyframes()) do
-		local k = { Time = kf.Time, Name = kf.Name, Poses = {}, Markers = {} }
-		for _, c in ipairs(kf:GetChildren()) do
-			if c:IsA("Pose") then
-				k.Poses[#k.Poses + 1] = readPose(c)
-			elseif c:IsA("KeyframeMarker") then
-				k.Markers[#k.Markers + 1] = { Name = c.Name, Value = c.Value }
-			end
-		end
-		data.Keyframes[#data.Keyframes + 1] = k
+local function ids()
+	local t = {}
+	for i, e in ipairs(order) do
+		t[i] = assetUrl(e.id)
 	end
-	table.sort(data.Keyframes, function(a, b)
-		return a.Time < b.Time
-	end)
-	return data
+	return table.concat(t, "\n")
 end
 
--- ambil KeyframeSequence: KSP dulu, fallback GetObjects
+local function detail()
+	local t = {}
+	for i, e in ipairs(order) do
+		t[i] = e.id .. " | " .. e.name .. " | " .. e.source
+	end
+	return table.concat(t, "\n")
+end
+
+local function copy(text)
+	if not canClip then
+		return false
+	end
+	return (pcall(setclipboard, text))
+end
+
+local function dumpAll()
+	if #order == 0 then
+		setStatus("belum ada animasi ketemu")
+		return false
+	end
+	local plain = ids()
+	local saved = false
+	if canWrite then
+		saved = (pcall(writefile, FOLDER .. "/ids.txt", plain))
+		pcall(writefile, FOLDER .. "/ids_detail.txt", detail())
+	end
+	local copied = copy(plain)
+
+	local where = {}
+	if saved then
+		where[#where + 1] = FOLDER .. "/ids.txt"
+	end
+	if copied then
+		where[#where + 1] = "clipboard"
+	end
+	local msg
+	if #where > 0 then
+		msg = ("%d id -> %s"):format(#order, table.concat(where, " + "))
+	else
+		msg = ("%d id, tapi executor ga punya writefile/setclipboard"):format(#order)
+	end
+	setStatus(msg)
+	print("[AnimRip] " .. msg)
+	return true
+end
+
+----------------------------------------------------------------
+-- Preview (PLAY)
+----------------------------------------------------------------
+-- ambil KeyframeSequence buat diputar: KSP dulu, fallback GetObjects
 local function loadSequence(id)
-	local url = "rbxassetid://" .. id
+	local url = assetUrl(id)
 	local ok, ks = pcall(function()
 		return KSP:GetKeyframeSequenceAsync(url)
 	end)
@@ -309,190 +141,6 @@ local function loadSequence(id)
 		end
 	end
 	return nil, firstErr
-end
-
-local function fetchData(id)
-	if cache[id] then
-		return cache[id]
-	end
-	local ks, err = loadSequence(id)
-	if not ks then
-		return nil, err
-	end
-	local ok, data = pcall(readSequence, ks)
-	pcall(function()
-		ks:Destroy()
-	end)
-	if not ok then
-		return nil, tostring(data)
-	end
-	cache[id] = data
-	return data
-end
-
-----------------------------------------------------------------
--- Nama asli (katalog Roblox)
-----------------------------------------------------------------
-local PENDING = {}
-local infoCache = {} -- id -> info table | false (gagal) | PENDING (lagi diminta)
-
-local function isTransient(err)
-	err = tostring(err):lower()
-	return err:find("429", 1, true) ~= nil
-		or err:find("throttl", 1, true) ~= nil
-		or err:find("too many", 1, true) ~= nil
-		or err:find("timed out", 1, true) ~= nil
-		or err:find("timeout", 1, true) ~= nil
-		or err:find("50%d") ~= nil
-end
-
--- info asset dari katalog; di-cache. Yield. Gagal permanen (private/dihapus) = nil, ga di-retry.
-local function getInfo(id)
-	local c = infoCache[id]
-	while c == PENDING and alive do
-		task.wait(0.1)
-		c = infoCache[id]
-	end
-	if c == PENDING then
-		return nil
-	end
-	if c ~= nil then
-		return c or nil
-	end
-	infoCache[id] = PENDING
-	local info
-	for attempt = 1, NAME_RETRIES do
-		local ok, res = pcall(function()
-			return MPS:GetProductInfo(tonumber(id), Enum.InfoType.Asset)
-		end)
-		if ok and type(res) == "table" then
-			info = res
-			break
-		end
-		if ok or not isTransient(res) or attempt == NAME_RETRIES then
-			break
-		end
-		task.wait(attempt) -- backoff kalau kena rate limit
-	end
-	infoCache[id] = info or false
-	return info
-end
-
-local function resolveName(e)
-	if e.realName then
-		return e.realName
-	end
-	local info = getInfo(e.id)
-	local name = pickName(info and info.Name, e.name)
-	e.realName = name
-	return name
-end
-
--- antrean pelan buat label GUI (satu worker, ada jeda biar ga kena rate limit)
-local nameQueue, queueRunning = {}, false
-local function queueName(e, onDone)
-	nameQueue[#nameQueue + 1] = { e = e, cb = onDone }
-	if queueRunning then
-		return
-	end
-	queueRunning = true
-	task.spawn(function()
-		while alive and #nameQueue > 0 do
-			local job = table.remove(nameQueue, 1)
-			local needNet = infoCache[job.e.id] == nil
-			resolveName(job.e)
-			if job.cb then
-				pcall(job.cb)
-			end
-			if needNet then
-				task.wait(NAME_DELAY)
-			end
-		end
-		queueRunning = false
-	end)
-end
-
-----------------------------------------------------------------
--- Tulis file
-----------------------------------------------------------------
-
-local function writeOut(base, xml)
-	if not canWrite then
-		return nil
-	end
-	local p = FOLDER .. "/" .. base .. ".rbxmx"
-	if pcall(writefile, p, xml) then
-		return p
-	end
-	-- beberapa executor nolak ekstensi asing -> .txt, tinggal rename ke .rbxmx
-	p = FOLDER .. "/" .. base .. ".txt"
-	if pcall(writefile, p, xml) then
-		return p
-	end
-	return nil
-end
-
-local function dump(rawId)
-	local id = parseId(rawId)
-	if not id then
-		return nil, "id ga valid"
-	end
-	local e = found[id] or { id = id, name = "?", source = "manual" }
-	local data, err = fetchData(id)
-	if not data then
-		return nil, err
-	end
-	local name = resolveName(e)
-	local item = { name = name, data = data, assetId = INCLUDE_ANIMATION_REF and assetUrl(id) or nil }
-	local xml = toXML({ item })
-	local path = writeOut(safeName(name) .. "_" .. id, xml)
-	if path then
-		return path
-	end
-	if type(setclipboard) == "function" then
-		setclipboard(xml)
-		return "clipboard (executor ga punya writefile)"
-	end
-	return nil, "ga bisa nulis file / clipboard"
-end
-
-local dumping = false
-local function dumpAll()
-	if dumping then
-		return
-	end
-	dumping = true
-	local total, okN, items, failed, index = #order, 0, {}, {}, {}
-	for i, e in ipairs(order) do
-		if not alive then
-			break
-		end
-		local name = resolveName(e)
-		setStatus(("dump %d/%d: %s"):format(i, total, name))
-		local data = fetchData(e.id)
-		local line = assetUrl(e.id) .. " | " .. (name:gsub("[\r\n]+", " ")) .. " | " .. e.source
-		index[#index + 1] = line
-		if data then
-			local item = { name = name, data = data, assetId = INCLUDE_ANIMATION_REF and assetUrl(e.id) or nil }
-			items[#items + 1] = item
-			if writeOut(safeName(name) .. "_" .. e.id, toXML({ item })) then
-				okN = okN + 1
-			end
-		else
-			failed[#failed + 1] = line
-		end
-		task.wait()
-	end
-	if #items > 0 then
-		writeOut("_ALL", toXML(items))
-	end
-	if canWrite then
-		pcall(writefile, FOLDER .. "/_ids.txt", table.concat(index, "\n"))
-		pcall(writefile, FOLDER .. "/_failed.txt", table.concat(failed, "\n"))
-	end
-	setStatus(("selesai: %d ok, %d gagal -> %s/"):format(okN, #failed, FOLDER))
-	print(("[AnimRip] %d ok, %d gagal. File ada di %s/"):format(okN, #failed, FOLDER))
-	dumping = false
 end
 
 local function playId(id)
@@ -544,8 +192,8 @@ local function add(rawId, name, source)
 	if not rawId or rawId == "" then
 		return
 	end
-	local id = parseId(rawId)
-	if not id or found[id] then
+	local id = tostring(rawId):match("%d+")
+	if not id or id == "0" or found[id] then
 		return
 	end
 	local e = { id = id, name = name or "?", source = source or "?" }
@@ -618,8 +266,8 @@ local function mkButton(parent, text, pos, size, color)
 end
 
 local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(380, 320)
-main.Position = UDim2.new(0.5, -190, 0, 40)
+main.Size = UDim2.fromOffset(340, 320)
+main.Position = UDim2.new(0.5, -170, 0, 40)
 main.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -629,7 +277,7 @@ local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, -190, 0, 30)
 title.Position = UDim2.fromOffset(10, 0)
 title.BackgroundTransparency = 1
-title.Text = "Anim Dump (0)"
+title.Text = "Anim ID Dump (0)"
 title.TextColor3 = Color3.fromRGB(235, 235, 245)
 title.Font = Enum.Font.GothamBold
 title.TextSize = 14
@@ -673,7 +321,7 @@ setStatus = function(t)
 end
 
 setCount = function(n)
-	title.Text = "Anim Dump (" .. n .. ")"
+	title.Text = "Anim ID Dump (" .. n .. ")"
 end
 
 -- drag lewat title (mouse & touch)
@@ -720,8 +368,9 @@ addRow = function(e)
 
 	local lbl = Instance.new("TextLabel")
 	lbl.Position = UDim2.fromOffset(6, 2)
-	lbl.Size = UDim2.new(1, -166, 1, -4)
+	lbl.Size = UDim2.new(1, -128, 1, -4)
 	lbl.BackgroundTransparency = 1
+	lbl.Text = e.name .. "\n" .. e.id
 	lbl.TextColor3 = Color3.fromRGB(220, 220, 230)
 	lbl.Font = Enum.Font.Gotham
 	lbl.TextSize = 11
@@ -729,28 +378,8 @@ addRow = function(e)
 	lbl.TextTruncate = Enum.TextTruncate.AtEnd
 	lbl.Parent = row
 
-	-- nama asli masuk belakangan (antrean), sebelum itu tampil nama instance
-	local function refreshLabel()
-		lbl.Text = (e.realName or e.name) .. "\n" .. assetUrl(e.id)
-	end
-	refreshLabel()
-	if not e.realName then
-		queueName(e, refreshLabel)
-	end
-
-	local copyB = mkButton(row, "COPY", UDim2.new(1, -156, 0.5, -12), UDim2.fromOffset(40, 24), Color3.fromRGB(90, 70, 130))
-	local playB = mkButton(row, "PLAY", UDim2.new(1, -112, 0.5, -12), UDim2.fromOffset(46, 24), Color3.fromRGB(50, 90, 150))
-	local saveB = mkButton(row, "RBXMX", UDim2.new(1, -62, 0.5, -12), UDim2.fromOffset(56, 24), Color3.fromRGB(50, 120, 80))
-
-	keep(copyB.Activated:Connect(function()
-		local url = assetUrl(e.id)
-		local clip = setclipboard or toclipboard
-		if type(clip) == "function" and pcall(clip, url) then
-			setStatus("disalin: " .. url)
-		else
-			setStatus(url .. " (executor ga punya setclipboard)")
-		end
-	end))
+	local playB = mkButton(row, "PLAY", UDim2.new(1, -118, 0.5, -12), UDim2.fromOffset(52, 24), Color3.fromRGB(50, 90, 150))
+	local copyB = mkButton(row, "COPY", UDim2.new(1, -62, 0.5, -12), UDim2.fromOffset(56, 24), Color3.fromRGB(50, 120, 80))
 
 	keep(playB.Activated:Connect(function()
 		task.spawn(function()
@@ -760,18 +389,17 @@ addRow = function(e)
 		end)
 	end))
 
-	keep(saveB.Activated:Connect(function()
-		task.spawn(function()
-			setStatus("narik keyframe...")
-			local path, err = dump(e.id)
-			setStatus(path and ("tersimpan: " .. path) or ("gagal: " .. tostring(err):sub(1, 60)))
-		end)
+	keep(copyB.Activated:Connect(function()
+		local url = assetUrl(e.id)
+		if copy(url) then
+			setStatus("dicopy: " .. url)
+		else
+			setStatus("ga ada setclipboard, id: " .. url)
+		end
 	end))
 end
 
-keep(allBtn.Activated:Connect(function()
-	task.spawn(dumpAll)
-end))
+keep(allBtn.Activated:Connect(dumpAll))
 
 keep(stopBtn.Activated:Connect(function()
 	if currentTrack then
@@ -860,22 +488,10 @@ end
 keep(closeBtn.Activated:Connect(destroy))
 
 env.AnimRip = {
-	dump = dump,
 	dumpAll = dumpAll,
-	name = function(rawId)
-		local id = parseId(rawId)
-		if not id then
-			return nil, "id ga valid"
-		end
-		return resolveName(found[id] or { id = id, name = "?", source = "manual" })
-	end,
-	assetId = function(rawId)
-		local id = parseId(rawId)
-		return id and assetUrl(id) or nil
-	end,
+	ids = ids,
 	list = order,
-	toXML = toXML,
 	destroy = destroy,
 }
 
-print("[AnimRip] jalan. Tekan RBXMX di baris animasi, atau DUMP ALL.")
+print("[AnimRip] jalan. Tekan COPY di baris animasi, atau DUMP ALL buat simpan semua ID.")
