@@ -1,32 +1,490 @@
 --[[
-	Animation ID Dumper  (Roblox / Delta)
+	Animation Dumper v2 -> .rbxmx / .rbxm  (Roblox / Delta)
 
-	Ngumpulin semua ID animasi yang ketemu di game. CUMA ID-nya:
-	ga narik keyframe, ga bikin .rbxm / .rbxmx.
+	Narik KeyframeSequence lengkap (keyframe, pose, CFrame, easing, weight,
+	marker, loop, priority, hip height) lalu nulis ke model Roblox (.rbxmx XML)
+	yang bisa langsung di-drag ke Studio. Format output tetap rbxmx / rbxm.
 
-	Sumber ID:
-	  - semua instance Animation (termasuk yang dibikin runtime & nil instances)
-	  - animasi yang lagi/pernah diputar (player + NPC)
+	=== YANG BARU DI v2 ===========================================================
+	EMOTE GUI SCANNER (bisa milih dump yang ada di GUI emote doang)
+	  Sumber "GUI" yang dikenali:
+	    1. Emote wheel bawaan Roblox  (HumanoidDescription: GetEquippedEmotes/GetEmotes)
+	    2. GUI emote bikinan game (PlayerGui): baca attribute, value child, objek Animation,
+	       nama tombol <-> Animation, bahkan isi handler tombol (getconnections + upvalue)
+	    3. Data module emote game (ModuleScript yang udah ke-load, mis. "Emotes", "Dances")
+	    4. Folder Animation di ReplicatedStorage/StarterGui dst yang namanya emote/dance
+	  DANCE vs EMOTE dibedain sesuai GUI-nya:
+	    - nama tab / frame / section header di GUI ("Dances", "Emotes", ...)
+	    - field Category/Type/Tab di data module
+	    - tab yang terakhir kamu klik (kalau GUI-nya pake tab tanpa nama jelas)
+	    - fallback: nama animasi (dance/groove/tari/...) lalu katalog Roblox (AssetType emote)
+	  PINTAR:
+	    - LEARN : klik emote di GUI -> script nangkep animasi yang kemudian jalan, ID + kategori
+	      otomatis kecatat (nama tombol = nama emote)
+	    - AUTO  : script klik sendiri semua tombol emote di GUI (tombol beli/close/dll di-skip)
+	      dan nangkep ID-nya; emote wheel yang ga bisa di-load langsung ditarik via PlayEmote
+	    - validasi ID lemah lewat katalog (AssetType Animation/EmoteAnimation) biar ga ada ID nyasar
+	    - nama emote ngikut GUI (PREFER_GUI_NAME), fallback katalog, fallback nama instance
+	DUMP
+	    - filter: SEMUA | GUI | DANCE | EMOTE | LAIN + search + centang manual
+	    - DUMP = yang dicentang, atau semua yang lagi tampil (sesuai filter)
+	    - dump paralel (DUMP_THREADS), retry kalau kena rate limit, memori aman (per chunk)
+	    - folder rapi: AnimDump/GUI_Dance, AnimDump/GUI_Emote, AnimDump/Other
+	    - _ALL pecah per MAX_PER_FILE animasi, di dalamnya dikelompokin Folder per kategori
 
-	Output: workspace/AnimDump/ids.txt         -> rbxassetid://<id>, satu per baris
-	        workspace/AnimDump/ids_detail.txt  -> <id> | <nama> | <sumber>
-	(DUMP ALL juga nyalin ids.txt ke clipboard kalau executor support)
+	Format ID: semua ID ditampilin & disimpan dalam bentuk rbxassetid://<id>
+	  (GUI, tombol COPY, _ids.txt, _failed.txt, objek Animation di .rbxmx).
+	  dump()/AnimRip.name() nerima "123", 123, atau "rbxassetid://123".
 
-	API:
-	  getgenv().AnimRip.dumpAll()  -> tulis file + copy clipboard
-	  getgenv().AnimRip.ids()      -> string "rbxassetid://..." (satu per baris)
-	  getgenv().AnimRip.list       -> daftar entry {id, name, source}
-	  getgenv().AnimRip.destroy()
+	Output : workspace/AnimDump/<GUI_Dance|GUI_Emote|Other>/<nama>_<id>.rbxmx
+	         workspace/AnimDump/_ALL.rbxmx (+ _GUI / _DANCE / _EMOTE / _LAIN / _SELECTED)
+	         workspace/AnimDump/_ids.txt     rbxassetid://<id> | nama | kategori | sumber
+	         workspace/AnimDump/_failed.txt  rbxassetid://<id> | ... | alasan gagal
+
+	API  (getgenv().AnimRip)
+	  .dump("123")        dump 1 id            .dumpAll()       dump semua
+	  .dumpGui()          semua emote di GUI   .dumpDance()     emote GUI kategori dance
+	  .dumpEmote()        emote GUI non-dance  .dumpSelected()  yang dicentang
+	  .scan()             scan ulang GUI       .auto()          auto-klik tombol emote
+	  .setFilter("GUI")   ALL|GUI|DANCE|EMOTE|LAIN
+	  .setFormat("rbxm")  "rbxmx" (default) atau "rbxm"
+	  .name("123")        nama asli (yield)    .assetId("123")  "rbxassetid://123"
+	  .entries()          daftar entry lengkap {id,name,source,category,inGui,...}
+	  .list               daftar entry mentah  .destroy()
+
+	Config bisa dioverride sebelum execute:
+	  getgenv().AnimRipConfig = { FORMAT = "rbxm", DUMP_THREADS = 2, LEARN = false }
 ]]
 
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local KSP = game:GetService("KeyframeSequenceProvider")
+local MPS = game:GetService("MarketplaceService")
+local CoreGui
+pcall(function()
+	CoreGui = game:GetService("CoreGui")
+end)
 local lp = Players.LocalPlayer
+while not lp do
+	task.wait(0.1)
+	lp = Players.LocalPlayer
+end
 
-local FOLDER = "AnimDump"
-local POLL_INTERVAL = 0.5
-local MAX_ROWS = 300 -- batas baris GUI (DUMP ALL tetap ngitung semuanya)
+local CFG = {
+	FOLDER = "AnimDump",
+	FORMAT = "rbxmx", -- "rbxmx" | "rbxm" (isinya sama-sama XML Roblox)
+	SUBFOLDERS = true, -- pisah folder GUI_Dance / GUI_Emote / Other
+	INCLUDE_ANIMATION_REF = true, -- taruh objek Animation (AnimationId = rbxassetid://id) di samping KeyframeSequence
+	PREFER_GUI_NAME = true, -- nama file/animasi ngikut label di GUI emote
+	MAX_ROWS = 250, -- batas baris GUI yang dirender (dump tetap ngitung semuanya)
+	POLL_INTERVAL = 0.5,
+	NAME_RETRIES = 3, -- percobaan GetProductInfo per id
+	NAME_DELAY = 0.15, -- jeda antar request nama buat label GUI
+	INFO_SPACING = 0.12, -- jarak minimum antar request GetProductInfo (anti rate limit)
+	FETCH_RETRIES = 2, -- retry narik keyframe kalau error sementara
+	DUMP_THREADS = 3, -- worker paralel pas dump banyak
+	MAX_PER_FILE = 120, -- animasi per file _ALL (anti file kegedean)
+	SCAN_GUI = true, -- scan GUI emote di PlayerGui
+	SCAN_NATIVE = true, -- emote wheel / emote milik karakter (HumanoidDescription)
+	SCAN_MODULES = true, -- baca ModuleScript emote yang udah ke-load (butuh getloadedmodules)
+	SCAN_CONNECTIONS = true, -- intip handler tombol (butuh getconnections + debug.getupvalues)
+	OWNED_EMOTES_AS_GUI = false, -- emote yang dimiliki tapi ga dipasang di wheel dianggap "GUI" juga
+	LEARN = true, -- klik emote di GUI -> animasi yang jalan otomatis dicatat
+	LEARN_ANY = false, -- true = tombol apa aja (walau bukan GUI emote) ikut dipelajari
+	CLICK_WINDOW = 1.5, -- detik maksimal dari klik ke animasi mulai main
+	AUTO_WAIT = 1.4, -- detik nunggu animasi keluar setelah auto-klik
+	AUTO_GAP = 0.2, -- jeda antar auto-klik
+	AUTO_MAX = 600, -- batas tombol yang di-klik sekali AUTO
+	UI_SCALE = 1,
+}
+
+--[[PURE-BEGIN]]
+-- Bagian murni (tanpa API Roblox): tabel data -> XML model Roblox + helper teks.
+-- data = {
+--   Loop=bool, Priority=int, HipHeight=number?,
+--   Keyframes = { {Time=n, Name=s, Poses={pose...}, Markers={{Name=,Value=}}} }
+-- }
+-- pose = {Name, CFrame={x,y,z,r00..r22}, EasingStyle=int, EasingDirection=int, Weight, Children={pose...}}
+-- item = {name=, data=, assetId=?, group=?}   (group -> dibungkus Folder)
+local function esc(s)
+	s = tostring(s == nil and "" or s)
+	if utf8 and utf8.len and not utf8.len(s) then
+		s = s:gsub("[\128-\255]", "?") -- UTF-8 rusak -> XML ga valid, buang byte tinggi
+	end
+	s = s:gsub("[\0-\8\11\12\14-\31\127]", "")
+	s = s:gsub("&", "&amp;")
+	s = s:gsub("<", "&lt;")
+	s = s:gsub(">", "&gt;")
+	s = s:gsub('"', "&quot;")
+	return s
+end
+
+local function num(n)
+	n = tonumber(n) or 0
+	if n ~= n or n == math.huge or n == -math.huge then
+		return "0"
+	end
+	return string.format("%.9g", n)
+end
+
+local CF_KEYS = { "X", "Y", "Z", "R00", "R01", "R02", "R10", "R11", "R12", "R20", "R21", "R22" }
+
+local function toXML(list)
+	local out = {
+		'<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">',
+	}
+	local ref = 0
+
+	local function put(s)
+		out[#out + 1] = s
+	end
+
+	local function open(class, name)
+		ref = ref + 1
+		put('<Item class="' .. class .. '" referent="RBX' .. ref .. '">')
+		put("<Properties>")
+		put('<string name="Name">' .. esc(name) .. "</string>")
+	end
+
+	local function emitPose(p)
+		open("Pose", p.Name)
+		local c = p.CFrame or {}
+		put('<CoordinateFrame name="CFrame">')
+		for i = 1, 12 do
+			local default = (i == 4 or i == 8 or i == 12) and 1 or 0 -- identity kalau data kosong
+			put("<" .. CF_KEYS[i] .. ">" .. num(c[i] or default) .. "</" .. CF_KEYS[i] .. ">")
+		end
+		put("</CoordinateFrame>")
+		put('<token name="EasingDirection">' .. num(p.EasingDirection) .. "</token>")
+		put('<token name="EasingStyle">' .. num(p.EasingStyle) .. "</token>")
+		put('<float name="Weight">' .. num(p.Weight == nil and 1 or p.Weight) .. "</float>")
+		put("</Properties>")
+		for _, child in ipairs(p.Children or {}) do
+			emitPose(child)
+		end
+		put("</Item>")
+	end
+
+	local function emitItem(item)
+		local data = item.data
+		-- item.assetId (mis. "rbxassetid://123") -> objek Animation di samping KeyframeSequence
+		if item.assetId then
+			open("Animation", item.name)
+			put('<Content name="AnimationId"><url>' .. esc(item.assetId) .. "</url></Content>")
+			put("</Properties>")
+			put("</Item>")
+		end
+		open("KeyframeSequence", item.name)
+		put('<bool name="Loop">' .. (data.Loop and "true" or "false") .. "</bool>")
+		put('<token name="Priority">' .. num(data.Priority) .. "</token>")
+		if data.HipHeight then
+			put('<float name="AuthoredHipHeight">' .. num(data.HipHeight) .. "</float>")
+		end
+		put("</Properties>")
+		for _, kf in ipairs(data.Keyframes) do
+			open("Keyframe", kf.Name or "Keyframe")
+			put('<float name="Time">' .. num(kf.Time) .. "</float>")
+			put("</Properties>")
+			for _, p in ipairs(kf.Poses or {}) do
+				emitPose(p)
+			end
+			for _, m in ipairs(kf.Markers or {}) do
+				open("KeyframeMarker", m.Name)
+				put('<string name="Value">' .. esc(m.Value or "") .. "</string>")
+				put("</Properties>")
+				put("</Item>")
+			end
+			put("</Item>")
+		end
+		put("</Item>")
+	end
+
+	local groups, gorder, loose = {}, {}, {}
+	for _, item in ipairs(list) do
+		local g = item.group
+		if g and g ~= "" then
+			if not groups[g] then
+				groups[g] = {}
+				gorder[#gorder + 1] = g
+			end
+			local t = groups[g]
+			t[#t + 1] = item
+		else
+			loose[#loose + 1] = item
+		end
+	end
+	for _, item in ipairs(loose) do
+		emitItem(item)
+	end
+	for _, g in ipairs(gorder) do
+		open("Folder", g)
+		put("</Properties>")
+		for _, item in ipairs(groups[g]) do
+			emitItem(item)
+		end
+		put("</Item>")
+	end
+
+	put("</roblox>")
+	return table.concat(out, "\n")
+end
+
+-- "123" / 123 / "rbxassetid://123" / "http://www.roblox.com/asset/?id=123" / ".../catalog/123/x" -> "123"
+local function parseId(raw)
+	if raw == nil then
+		return nil
+	end
+	local s
+	if type(raw) == "number" then
+		if raw ~= raw or raw < 1 or raw >= 1e16 then
+			return nil
+		end
+		s = string.format("%.0f", raw) -- tostring() bisa jadi "1.2e+14" buat id 15 digit
+	elseif type(raw) == "string" then
+		s = raw
+	else
+		return nil
+	end
+	local id = s:match("[Rr][Bb][Xx][Aa][Ss][Ss][Ee][Tt][Ii][Dd]://%s*(%d+)")
+		or s:match("[%?&][Ii][Dd]=(%d+)")
+		or s:match("[%?&][Aa][Ss][Ss][Ee][Tt][Ii][Dd]=(%d+)")
+		or s:match("/[Cc]atalog/(%d+)")
+		or s:match("/[Ll]ibrary/(%d+)")
+		or s:match("^%s*(%d+)%s*$")
+	if not id then
+		return nil
+	end
+	id = id:gsub("^0+", "")
+	if id == "" or #id > 16 then
+		return nil
+	end
+	return id
+end
+
+-- sama kayak parseId tapi minimal N digit (buat ID dari GUI/data biar angka kecil ga kebaca ID)
+local function parseIdMin(raw, minDigits)
+	local id = parseId(raw)
+	if id and #id >= minDigits then
+		return id
+	end
+	return nil
+end
+
+-- "123" -> "rbxassetid://123"
+local function assetUrl(id)
+	return "rbxassetid://" .. tostring(id)
+end
+
+local function trim(s)
+	return (tostring(s or ""):match("^%s*(.-)%s*$"))
+end
+
+local function stripTags(s)
+	s = tostring(s or "")
+	s = s:gsub("<[^>]*>", "")
+	return s
+end
+
+-- nama generik = bukan nama asli ("Animation", "Animation3", "?", kosong, angka doang)
+local GENERIC = {
+	[""] = true,
+	["?"] = true,
+	anim = true,
+	keyframesequence = true,
+	unnamed = true,
+	untitled = true,
+	default = true,
+	template = true,
+}
+local function isGenericName(n)
+	if type(n) ~= "string" then
+		return true
+	end
+	local k = (n:gsub("%s+", "")):lower()
+	return GENERIC[k] == true or k:match("^animation%d*$") ~= nil or k:match("^%d+$") ~= nil
+end
+
+-- "FlossDance_2 emote" -> {"floss","dance","emote"} (camelCase dipecah, angka/simbol dibuang)
+local function tokens(s)
+	s = tostring(s == nil and "" or s)
+	s = s:gsub("(%l)(%u)", "%1 %2")
+	s = s:gsub("(%u)(%u%l)", "%1 %2")
+	s = s:lower()
+	s = s:gsub("[^%a]+", " ")
+	local t = {}
+	for w in s:gmatch("%S+") do
+		t[#t + 1] = w
+	end
+	return t
+end
+
+local function isDanceTok(t)
+	return t:sub(1, 4) == "danc" or t:sub(-5) == "dance" or t == "tari" or t == "joget" or t == "goyang"
+end
+
+local function isEmoteTok(t)
+	return t:sub(1, 5) == "emote" or t == "emoticon" or t == "emoticons" or t == "gesture" or t == "gestures"
+end
+
+-- kata kunci kategori STRICT (buat nama tab/frame/header GUI): "dance" | "emote" | "both" | nil
+local function ctxKind(s)
+	local d, e = false, false
+	for _, t in ipairs(tokens(s)) do
+		if isDanceTok(t) then
+			d = true
+		elseif isEmoteTok(t) then
+			e = true
+		end
+	end
+	if d and e then
+		return "both"
+	end
+	if d then
+		return "dance"
+	end
+	if e then
+		return "emote"
+	end
+	return nil
+end
+
+-- tebakan kategori dari NAMA animasi doang (lebih longgar, cuma ngenalin dance)
+local DANCE_WORDS = {
+	groove = true, boogie = true, disco = true, ballet = true, salsa = true, tango = true,
+	waltz = true, twerk = true, moonwalk = true, floss = true, shuffle = true, breakdance = true,
+	macarena = true, tarian = true, joged = true, hiphop = true,
+}
+local function nameCat(s)
+	for _, t in ipairs(tokens(s)) do
+		if isDanceTok(t) or DANCE_WORDS[t] then
+			return "dance"
+		end
+	end
+	return nil
+end
+
+-- sufiks umum nama tombol/frame yang bukan bagian nama emote ("FlossButton" -> "Floss")
+local SUFFIXES = { "Button", "Btn", "Frame", "Template", "Holder", "Slot", "Item", "Emote" }
+local function stripSuffix(n)
+	n = trim(n)
+	local changed = true
+	while changed do
+		changed = false
+		for _, suf in ipairs(SUFFIXES) do
+			if #n > #suf + 1 and n:sub(-#suf):lower() == suf:lower() then
+				n = n:sub(1, #n - #suf)
+				n = n:gsub("[_%-%s]+$", "")
+				changed = true
+				break
+			end
+		end
+	end
+	return n
+end
+
+-- label GUI -> nama bersih, "" kalau cuma noise (Button, Frame, angka, harga, kepanjangan)
+local GUI_NOISE = {
+	button = true, btn = true, textbutton = true, imagebutton = true, frame = true, template = true,
+	item = true, holder = true, slot = true, emote = true, emotes = true, dance = true, dances = true,
+	label = true, text = true, icon = true, image = true, clone = true, example = true, new = true,
+	container = true, cell = true, tile = true, card = true, option = true, entry = true,
+}
+local function guiLabelClean(raw)
+	local s = trim(stripTags(tostring(raw or "")))
+	if s == "" or #s > 48 then
+		return ""
+	end
+	local letters = (s:gsub("[^%a\128-\255]", ""))
+	if #letters < 2 then
+		return "" -- angka / simbol / harga ("R$ 50") doang
+	end
+	local toks = tokens(s)
+	if #toks > 0 then
+		local allNoise = true
+		for _, t in ipairs(toks) do
+			if not GUI_NOISE[t] then
+				allNoise = false
+				break
+			end
+		end
+		if allNoise then
+			return ""
+		end
+	end
+	return s
+end
+
+-- pilih nama terbaik: (nama GUI) > nama asset katalog > nama instance/track > "Animation"
+local function pickName(assetName, instName, guiName, preferGui)
+	if preferGui and type(guiName) == "string" and guiName ~= "" and not isGenericName(guiName) then
+		return trim(guiName)
+	end
+	if not isGenericName(assetName) then
+		return trim(assetName)
+	end
+	if not isGenericName(instName) then
+		return trim(instName)
+	end
+	if type(guiName) == "string" and guiName ~= "" and not isGenericName(guiName) then
+		return trim(guiName)
+	end
+	-- semuanya generik: pakai yang ada isinya, kalau ga ada ya "Animation"
+	local a, i = trim(assetName), trim(instName)
+	if a ~= "" and a ~= "?" then
+		return a
+	end
+	if i ~= "" and i ~= "?" then
+		return i
+	end
+	return "Animation"
+end
+
+-- nama -> aman buat nama file (ASCII, tanpa spasi/simbol)
+local function safeName(s)
+	s = tostring(s or "Animation")
+	s = s:gsub("[^%w_%-]+", "_")
+	s = s:gsub("_+", "_")
+	s = s:gsub("^_+", "")
+	s = s:gsub("_+$", "")
+	if #s > 60 then
+		s = s:sub(1, 60)
+		s = s:gsub("_+$", "")
+	end
+	if s == "" then
+		s = "Animation"
+	end
+	return s
+end
+
+-- nama key (attribute/field) -> seberapa kuat petunjuk "ini ID animasi"
+-- 3 = emote*, 2 = anim*/dance*, 1 = id/assetid, 0 = netral, -1 = jelas bukan (icon, userid, price, ...)
+local KEY_BAD = {
+	"icon", "image", "thumb", "user", "player", "gamepass", "product", "place", "universe", "group",
+	"badge", "sound", "audio", "mesh", "texture", "decal", "shirt", "pants", "price", "color", "order",
+	"index", "layout", "sort", "zindex", "level", "rarity", "count", "amount", "version", "slot",
+}
+local function idKeyStrength(k)
+	if type(k) ~= "string" then
+		return 0
+	end
+	local l = k:lower()
+	for _, bad in ipairs(KEY_BAD) do
+		if l:find(bad, 1, true) then
+			return -1
+		end
+	end
+	if l:find("emote", 1, true) then
+		return 3
+	end
+	if l:find("anim", 1, true) or l:find("dance", 1, true) then
+		return 2
+	end
+	if l == "id" or l == "assetid" or l == "asset" or l == "rbxid" or l:sub(-2) == "id" then
+		return 1
+	end
+	return 0
+end
+--[[PURE-END]]
 
 ----------------------------------------------------------------
 -- Setup
@@ -35,92 +493,184 @@ local env = (getgenv and getgenv()) or _G
 if env.AnimRip and env.AnimRip.destroy then
 	pcall(env.AnimRip.destroy)
 end
+if type(env.AnimRipConfig) == "table" then
+	for k, v in pairs(env.AnimRipConfig) do
+		if CFG[k] ~= nil then
+			CFG[k] = v
+		end
+	end
+end
 
 local canWrite = type(writefile) == "function"
-local canClip = type(setclipboard) == "function"
-if canWrite and type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(FOLDER) then
-	pcall(makefolder, FOLDER)
-end
+local hasFolderApi = type(isfolder) == "function" and type(makefolder) == "function"
+local getConns = (type(getconnections) == "function") and getconnections or nil
+local getUps = (debug and debug.getupvalues) or getupvalues
+local getConsts = (debug and debug.getconstants) or getconstants
+local getMods = (type(getloadedmodules) == "function") and getloadedmodules or nil
+local fireSig = (type(firesignal) == "function") and firesignal or nil
 
 local alive = true
 local conns = {}
 local found = {} -- id -> entry
 local order = {} -- urutan ketemu
 local animators = {}
+local cache, failCache, inflight = {}, {}, {}
 local currentTrack
-local rowCount = 0
-local addRow, setStatus, setCount -- diisi di bagian UI
+local cancelFlag = false
+local dumping, autoRunning, scanning = false, false, false
+local dirty = true
+local filterMode = "ALL"
+local searchText = ""
+local playerGui
+local gui
+local ui = { chips = {} }
+
+local btnInfo = setmetatable({}, { __mode = "k" }) -- tombol -> {label, ctx, ids, done}
+local hooked = setmetatable({}, { __mode = "k" })
+local queuedBtn = setmetatable({}, { __mode = "k" })
+local ctxCache = setmetatable({}, { __mode = "k" })
+local headerCache = setmetatable({}, { __mode = "k" })
+local activeTab = setmetatable({}, { __mode = "k" }) -- ScreenGui -> {cat, t}
+local btnQueue = {}
+local workerBusy = false
+local lastClick, lastTrack
+local nameIndex = {}
+local SELF_TAG = {} -- penanda handler milik script ini (biar ga ikut di-intip scanConnections)
+
+local function log(...)
+	print("[AnimRip]", ...)
+end
+
+local function markDirty()
+	dirty = true
+end
+
+local function setStatus(t)
+	if ui.status then
+		ui.status.Text = tostring(t)
+	end
+end
 
 local function keep(c)
-	table.insert(conns, c)
+	conns[#conns + 1] = c
+	if #conns > 4000 then -- buang koneksi yang udah mati
+		local fresh = {}
+		for _, x in ipairs(conns) do
+			local okc, live = pcall(function()
+				return x.Connected
+			end)
+			if not okc or live then
+				fresh[#fresh + 1] = x
+			end
+		end
+		conns = fresh
+	end
 	return c
 end
 
-----------------------------------------------------------------
--- Dump ID
-----------------------------------------------------------------
-local function assetUrl(id)
-	return "rbxassetid://" .. id
+local function safeFullName(inst)
+	local ok, n = pcall(function()
+		return inst:GetFullName()
+	end)
+	return ok and n or tostring(inst.Name)
 end
 
-local function ids()
-	local t = {}
-	for i, e in ipairs(order) do
-		t[i] = assetUrl(e.id)
-	end
-	return table.concat(t, "\n")
-end
-
-local function detail()
-	local t = {}
-	for i, e in ipairs(order) do
-		t[i] = e.id .. " | " .. e.name .. " | " .. e.source
-	end
-	return table.concat(t, "\n")
-end
-
-local function copy(text)
-	if not canClip then
+local function isOwnGui(inst)
+	if not gui then
 		return false
 	end
-	return (pcall(setclipboard, text))
+	local ok, res = pcall(function()
+		return inst == gui or inst:IsDescendantOf(gui)
+	end)
+	return ok and res
 end
 
-local function dumpAll()
-	if #order == 0 then
-		setStatus("belum ada animasi ketemu")
+local function getHumanoid()
+	local c = lp.Character
+	return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function getAnimator(create)
+	local hum = getHumanoid()
+	if not hum then
+		return nil
+	end
+	local a = hum:FindFirstChildOfClass("Animator")
+	if not a and create then
+		a = Instance.new("Animator")
+		a.Parent = hum
+	end
+	return a, hum
+end
+
+local function isLocalAnimator(animator)
+	local c = lp.Character
+	if not c then
 		return false
 	end
-	local plain = ids()
-	local saved = false
-	if canWrite then
-		saved = (pcall(writefile, FOLDER .. "/ids.txt", plain))
-		pcall(writefile, FOLDER .. "/ids_detail.txt", detail())
-	end
-	local copied = copy(plain)
-
-	local where = {}
-	if saved then
-		where[#where + 1] = FOLDER .. "/ids.txt"
-	end
-	if copied then
-		where[#where + 1] = "clipboard"
-	end
-	local msg
-	if #where > 0 then
-		msg = ("%d id -> %s"):format(#order, table.concat(where, " + "))
-	else
-		msg = ("%d id, tapi executor ga punya writefile/setclipboard"):format(#order)
-	end
-	setStatus(msg)
-	print("[AnimRip] " .. msg)
-	return true
+	local ok, res = pcall(function()
+		return animator:IsDescendantOf(c)
+	end)
+	return ok and res
 end
 
 ----------------------------------------------------------------
--- Preview (PLAY)
+-- Roblox -> tabel data
 ----------------------------------------------------------------
--- ambil KeyframeSequence buat diputar: KSP dulu, fallback GetObjects
+local function readPose(pose)
+	local e = {
+		Name = pose.Name,
+		CFrame = { pose.CFrame:GetComponents() },
+		EasingStyle = pose.EasingStyle.Value,
+		EasingDirection = pose.EasingDirection.Value,
+		Weight = pose.Weight,
+		Children = {},
+	}
+	for _, sub in ipairs(pose:GetChildren()) do
+		if sub:IsA("Pose") then
+			e.Children[#e.Children + 1] = readPose(sub)
+		end
+	end
+	return e
+end
+
+local function readSequence(ks)
+	local data = {
+		Loop = ks.Loop,
+		Priority = ks.Priority.Value,
+		Keyframes = {},
+	}
+	pcall(function()
+		data.HipHeight = ks.AuthoredHipHeight
+	end)
+	for _, kf in ipairs(ks:GetKeyframes()) do
+		local k = { Time = kf.Time, Name = kf.Name, Poses = {}, Markers = {} }
+		for _, c in ipairs(kf:GetChildren()) do
+			if c:IsA("Pose") then
+				k.Poses[#k.Poses + 1] = readPose(c)
+			elseif c:IsA("KeyframeMarker") then
+				k.Markers[#k.Markers + 1] = { Name = c.Name, Value = c.Value }
+			end
+		end
+		data.Keyframes[#data.Keyframes + 1] = k
+	end
+	table.sort(data.Keyframes, function(a, b)
+		return a.Time < b.Time
+	end)
+	return data
+end
+
+local function isTransient(err)
+	err = tostring(err):lower()
+	return err:find("%f[%d]429%f[%D]") ~= nil
+		or err:find("throttl", 1, true) ~= nil
+		or err:find("too many", 1, true) ~= nil
+		or err:find("timed out", 1, true) ~= nil
+		or err:find("timeout", 1, true) ~= nil
+		or err:find("%f[%d]5%d%d%f[%D]") ~= nil
+end
+
+-- ambil KeyframeSequence: KSP dulu, fallback GetObjects
 local function loadSequence(id)
 	local url = assetUrl(id)
 	local ok, ks = pcall(function()
@@ -129,35 +679,638 @@ local function loadSequence(id)
 	if ok and ks then
 		return ks
 	end
-	local firstErr = ok and "kosong" or tostring(ks)
+	local err1 = ok and "kosong" or tostring(ks)
 	local ok2, objs = pcall(function()
 		return game:GetObjects(url)
 	end)
-	if ok2 and objs then
+	if ok2 and type(objs) == "table" then
+		local curve = false
 		for _, o in ipairs(objs) do
 			if o:IsA("KeyframeSequence") then
 				return o
 			end
+			local nested = o:FindFirstChildWhichIsA("KeyframeSequence", true)
+			if nested then
+				return nested
+			end
+			if o:IsA("CurveAnimation") then
+				curve = true
+			end
 		end
+		if curve then
+			return nil, err1 .. " | CurveAnimation (belum didukung)"
+		end
+		err1 = err1 .. " | GetObjects: ga ada KeyframeSequence"
+	else
+		err1 = err1 .. " | GetObjects: " .. tostring(objs)
 	end
-	return nil, firstErr
+	return nil, err1
 end
 
+local function loadOnce(id)
+	local ks, err = loadSequence(id)
+	if not ks then
+		return nil, err
+	end
+	local ok, data = pcall(readSequence, ks)
+	pcall(function()
+		ks:Destroy()
+	end)
+	if not ok then
+		return nil, tostring(data)
+	end
+	if #data.Keyframes == 0 then
+		return nil, "kosong (0 keyframe)"
+	end
+	return data
+end
+
+-- single-flight + retry kalau error sementara + cache gagal 45 detik (force = abaikan cache gagal)
+local function fetchData(id, force)
+	local hit = cache[id]
+	if hit then
+		return hit
+	end
+	local f = failCache[id]
+	if f and not force and os.clock() - f.t < 45 then
+		return nil, f.err
+	end
+	if inflight[id] then
+		while inflight[id] and alive do
+			task.wait(0.05)
+		end
+		return cache[id], failCache[id] and failCache[id].err
+	end
+	inflight[id] = true
+	local data, err
+	for attempt = 1, CFG.FETCH_RETRIES + 1 do
+		local ok, d, e = pcall(loadOnce, id)
+		if ok and d then
+			data = d
+			break
+		end
+		err = ok and e or d
+		if not isTransient(err) then
+			break
+		end
+		task.wait(attempt * 0.7)
+	end
+	inflight[id] = nil
+	if data then
+		cache[id] = data
+		failCache[id] = nil
+		return data
+	end
+	err = tostring(err or "gagal"):sub(1, 160)
+	failCache[id] = { err = err, t = os.clock() }
+	return nil, err
+end
+
+----------------------------------------------------------------
+-- Katalog Roblox (nama asli + tipe asset)
+----------------------------------------------------------------
+local PENDING = {}
+local infoCache = {} -- id -> info table | false (gagal permanen) | PENDING
+local infoFailAt = {} -- id -> waktu gagal sementara (rate limit)
+local nextInfoAt = 0
+
+local function fetchInfo(id)
+	local info, transient
+	for attempt = 1, CFG.NAME_RETRIES do
+		local now = os.clock()
+		local at = math.max(nextInfoAt, now)
+		nextInfoAt = at + CFG.INFO_SPACING
+		if at > now then
+			task.wait(at - now)
+		end
+		local ok, res = pcall(function()
+			return MPS:GetProductInfo(tonumber(id), Enum.InfoType.Asset)
+		end)
+		if ok and type(res) == "table" then
+			info = res
+			break
+		end
+		if ok then
+			break -- balasan aneh, jangan diulang
+		end
+		transient = isTransient(res)
+		if not transient or attempt == CFG.NAME_RETRIES then
+			break
+		end
+		task.wait(attempt) -- backoff kalau kena rate limit
+	end
+	return info, transient
+end
+
+-- info asset dari katalog; di-cache. Yield. Gagal permanen (private/dihapus) = nil, ga di-retry.
+-- Gagal sementara (rate limit) = nil juga, tapi boleh dicoba lagi setelah 20 detik.
+local function getInfo(id)
+	local c = infoCache[id]
+	while c == PENDING and alive do
+		task.wait(0.1)
+		c = infoCache[id]
+	end
+	if c == PENDING then
+		return nil
+	end
+	if c ~= nil then
+		return c or nil
+	end
+	local fa = infoFailAt[id]
+	if fa and os.clock() - fa < 20 then
+		return nil
+	end
+	infoCache[id] = PENDING
+	local ok, info, transient = pcall(fetchInfo, id)
+	if not ok then
+		info, transient = nil, true
+	end
+	if info then
+		infoCache[id] = info
+		infoFailAt[id] = nil
+		return info
+	end
+	if transient then
+		infoCache[id] = nil
+		infoFailAt[id] = os.clock()
+	else
+		infoCache[id] = false
+	end
+	return nil
+end
+
+-- ID ini beneran animasi/emote? (katalog dulu, kalau katalog ga jawab coba load keyframe-nya)
+local function isAnimAsset(id)
+	local info = getInfo(id)
+	if info then
+		return info.AssetTypeId == 24 or info.AssetTypeId == 61
+	end
+	return fetchData(id) ~= nil
+end
+
+----------------------------------------------------------------
+-- Entry + bukti kategori (dance / emote / GUI)
+----------------------------------------------------------------
+-- ev = { gui=bool, cat="dance"|"emote", lv=number, guiName=, move=bool, char=bool, slot=, native= }
+-- level bukti: 3 = GUI/data (tab, section, field Category) | 2 = folder Animate / tab terakhir diklik
+--              1 = nama keyword / katalog | 0.5 = default emote
+local function applyEv(e, ev)
+	if not ev then
+		return false
+	end
+	local changed = false
+	if ev.gui and not e.inGui then
+		e.inGui = true
+		changed = true
+	end
+	if ev.guiName and ev.guiName ~= "" and not isGenericName(ev.guiName) then
+		if e.guiName == nil or (ev.lv or 1) > (e.guiNameLv or 0) then
+			if e.guiName ~= ev.guiName then
+				e.guiName = ev.guiName
+				e.realName = nil -- hitung ulang nama
+				changed = true
+			end
+			e.guiNameLv = ev.lv or 1
+		end
+	end
+	if ev.cat and (ev.lv or 0) > (e.catLv or 0) then
+		e.cat = ev.cat
+		e.catLv = ev.lv
+		changed = true
+	end
+	if ev.move then
+		e.move = true
+	end
+	if ev.char then
+		e.char = true
+	end
+	if ev.slot then
+		e.slot = ev.slot
+	end
+	if ev.native then
+		e.native = ev.native
+	end
+	return changed
+end
+
+local function add(rawId, name, source, ev)
+	if rawId == nil or rawId == "" then
+		return nil
+	end
+	local id = parseId(rawId)
+	if not id then
+		return nil
+	end
+	local e = found[id]
+	if e then
+		local changed = applyEv(e, ev)
+		if ev and ev.gui and not e.srcGui then
+			e.srcGui = true
+			e.source = source or e.source
+			changed = true
+		end
+		if (e.name == "?" or isGenericName(e.name)) and name and not isGenericName(name) then
+			e.name = name
+			e.realName = nil
+			changed = true
+		end
+		if changed then
+			markDirty()
+		end
+		return e
+	end
+	e = { id = id, name = (name and name ~= "") and name or "?", source = source or "?", catLv = 0 }
+	if ev and ev.gui then
+		e.srcGui = true
+	end
+	found[id] = e
+	order[#order + 1] = e
+	applyEv(e, ev)
+	local nc = nameCat(e.name)
+	if not nc and e.guiName then
+		nc = nameCat(e.guiName)
+	end
+	if nc then
+		applyEv(e, { cat = nc, lv = 1 })
+	end
+	markDirty()
+	return e
+end
+
+-- kategori akhir: "dance" | "emote" | "other"
+local function catOf(e)
+	if e.cat then
+		return e.cat
+	end
+	if e.inGui then
+		return "emote"
+	end
+	return "other"
+end
+
+local function folderOf(e)
+	if e.inGui then
+		return catOf(e) == "dance" and "GUI_Dance" or "GUI_Emote"
+	end
+	return "Other"
+end
+
+local function inMode(e, mode)
+	if mode == "GUI" then
+		return e.inGui == true
+	elseif mode == "DANCE" then
+		return e.inGui == true and catOf(e) == "dance"
+	elseif mode == "EMOTE" then
+		return e.inGui == true and catOf(e) == "emote"
+	elseif mode == "LAIN" then
+		return not e.inGui
+	end
+	return true
+end
+
+local function dispName(e)
+	return e.realName or (CFG.PREFER_GUI_NAME and e.guiName) or e.name
+end
+
+local function matchQuery(e, q)
+	if not q or q == "" then
+		return true
+	end
+	local hay = (dispName(e) .. " " .. e.name .. " " .. e.id .. " " .. tostring(e.source or "")):lower()
+	return hay:find(q, 1, true) ~= nil
+end
+
+local function currentView()
+	local view = {}
+	for _, e in ipairs(order) do
+		if not e.dead and inMode(e, filterMode) and matchQuery(e, searchText) then
+			view[#view + 1] = e
+		end
+	end
+	return view
+end
+
+----------------------------------------------------------------
+-- Nama asli
+----------------------------------------------------------------
+local function resolveName(e)
+	if e.realName then
+		return e.realName
+	end
+	local info = getInfo(e.id)
+	if info then
+		e.assetType = info.AssetTypeId
+		local nc = nameCat(info.Name)
+		if nc then
+			applyEv(e, { cat = nc, lv = 1 })
+		end
+		if e.assetType == 61 then
+			applyEv(e, { cat = "emote", lv = 0.5 })
+		end
+	end
+	local name = pickName(info and info.Name, e.name, e.guiName, CFG.PREFER_GUI_NAME)
+	e.realName = name
+	markDirty()
+	return name
+end
+
+-- antrean pelan buat label GUI (satu worker, ada jeda biar ga kena rate limit)
+local nameQueue, queueRunning = {}, false
+local function queueName(e, onDone)
+	nameQueue[#nameQueue + 1] = { e = e, cb = onDone }
+	if queueRunning then
+		return
+	end
+	queueRunning = true
+	task.spawn(function()
+		while alive and #nameQueue > 0 do
+			local job = table.remove(nameQueue, 1)
+			local needNet = infoCache[job.e.id] == nil
+			pcall(resolveName, job.e)
+			if job.cb then
+				pcall(job.cb)
+			end
+			if needNet then
+				task.wait(CFG.NAME_DELAY)
+			end
+		end
+		queueRunning = false
+	end)
+end
+
+----------------------------------------------------------------
+-- Tulis file
+----------------------------------------------------------------
+local folderReady = {}
+local function ensureFolder(path)
+	if folderReady[path] then
+		return true
+	end
+	if not canWrite or not hasFolderApi then
+		return false
+	end
+	local ok, exists = pcall(isfolder, path)
+	if not (ok and exists) then
+		pcall(makefolder, path)
+		ok, exists = pcall(isfolder, path)
+	end
+	if ok and exists then
+		folderReady[path] = true
+		return true
+	end
+	return false
+end
+
+local function writeOut(sub, base, xml)
+	if not canWrite then
+		return nil
+	end
+	local ext = (CFG.FORMAT == "rbxm") and "rbxm" or "rbxmx"
+	local dir = CFG.FOLDER
+	ensureFolder(dir)
+	local prefix = ""
+	if sub and sub ~= "" and CFG.SUBFOLDERS then
+		if ensureFolder(dir .. "/" .. sub) then
+			dir = dir .. "/" .. sub
+		else
+			prefix = sub .. "_" -- executor ga bisa bikin subfolder -> prefix nama file
+		end
+	end
+	local p = dir .. "/" .. prefix .. base .. "." .. ext
+	if pcall(writefile, p, xml) then
+		return p
+	end
+	-- beberapa executor nolak ekstensi asing -> .txt, tinggal rename ke .rbxmx
+	p = dir .. "/" .. prefix .. base .. ".txt"
+	if pcall(writefile, p, xml) then
+		return p
+	end
+	return nil
+end
+
+local function dumpEntry(e)
+	local data, err = fetchData(e.id)
+	if not data then
+		return nil, err
+	end
+	local name = resolveName(e)
+	local item = { name = name, data = data, assetId = CFG.INCLUDE_ANIMATION_REF and assetUrl(e.id) or nil }
+	local xml = toXML({ item })
+	local path = writeOut(folderOf(e), safeName(name) .. "_" .. e.id, xml)
+	if path then
+		return path
+	end
+	if type(setclipboard) == "function" and pcall(setclipboard, xml) then
+		return "clipboard (executor ga punya writefile)"
+	end
+	return nil, "ga bisa nulis file / clipboard"
+end
+
+local function dump(rawId)
+	local id = parseId(rawId)
+	if not id then
+		return nil, "id ga valid"
+	end
+	local e = found[id] or { id = id, name = "?", source = "manual", catLv = 0 }
+	return dumpEntry(e)
+end
+
+-- worker pool: fn(item, index) boleh yield
+local function runPool(list, nThreads, fn)
+	local idx, active, total = 0, 0, #list
+	local function worker()
+		while alive and not cancelFlag do
+			idx = idx + 1
+			local i = idx
+			if i > total then
+				break
+			end
+			local ok, err = pcall(fn, list[i], i)
+			if not ok then
+				log("worker error:", tostring(err))
+			end
+		end
+		active = active - 1
+	end
+	for _ = 1, math.max(1, math.min(nThreads, total)) do
+		active = active + 1
+		task.spawn(worker)
+	end
+	while active > 0 do
+		task.wait(0.1)
+	end
+end
+
+local function dumpEntries(entries, label)
+	if dumping then
+		setStatus("masih dumping... tekan STOP buat batalin")
+		return
+	end
+	if not canWrite then
+		setStatus("executor ga punya writefile -> pakai tombol SAVE per animasi (ke clipboard)")
+		return
+	end
+	dumping = true
+	cancelFlag = false
+	local list = {}
+	for _, e in ipairs(entries) do
+		if not e.dead then
+			list[#list + 1] = e
+		end
+	end
+	local total = #list
+	if total == 0 then
+		setStatus("ga ada animasi yang bisa di-dump (cek filter)")
+		dumping = false
+		return
+	end
+	local keyCache = {}
+	for _, e in ipairs(list) do
+		keyCache[e] = folderOf(e) .. "/" .. dispName(e):lower()
+	end
+	table.sort(list, function(a, b)
+		local ka, kb = keyCache[a], keyCache[b]
+		if ka ~= kb then
+			return ka < kb
+		end
+		return a.id < b.id
+	end)
+
+	local fileLabel = safeName(label)
+	local index, failed = {}, {}
+	local okN, done, wroteFail = 0, 0, 0
+	local nChunks = math.ceil(total / CFG.MAX_PER_FILE)
+	local aggregated = 0
+
+	for ci = 1, nChunks do
+		if not alive or cancelFlag then
+			break
+		end
+		local first = (ci - 1) * CFG.MAX_PER_FILE + 1
+		local last = math.min(total, ci * CFG.MAX_PER_FILE)
+		local slice, items, lines = {}, {}, {}
+		for i = first, last do
+			slice[#slice + 1] = list[i]
+		end
+		runPool(slice, CFG.DUMP_THREADS, function(e, si)
+			local name = resolveName(e)
+			local data, err = fetchData(e.id)
+			done = done + 1
+			setStatus(("dump %d/%d: %s"):format(done, total, name))
+			local line = assetUrl(e.id)
+				.. " | "
+				.. (name:gsub("[\r\n|]+", " "))
+				.. " | "
+				.. catOf(e)
+				.. (e.inGui and "+GUI" or "")
+				.. " | "
+				.. tostring(e.source):gsub("[\r\n]+", " ")
+			lines[si] = line
+			if data then
+				local item = {
+					name = name,
+					data = data,
+					assetId = CFG.INCLUDE_ANIMATION_REF and assetUrl(e.id) or nil,
+					group = folderOf(e),
+				}
+				items[si] = item
+				-- file satuan: KeyframeSequence langsung di root (kayak Reel.rbxm), tanpa Folder pembungkus
+				local single = { name = item.name, data = item.data, assetId = item.assetId }
+				if writeOut(folderOf(e), safeName(name) .. "_" .. e.id, toXML({ single })) then
+					okN = okN + 1
+				else
+					wroteFail = wroteFail + 1
+					lines[si] = line .. " | (gagal nulis file)"
+				end
+			else
+				failed[#failed + 1] = line .. " | " .. tostring(err)
+			end
+			cache[e.id] = nil -- lepas memori, ga dipakai lagi
+		end)
+		local packed = {}
+		for si = 1, #slice do
+			if lines[si] then
+				index[#index + 1] = lines[si]
+			end
+			if items[si] then
+				packed[#packed + 1] = items[si]
+			end
+		end
+		if #packed > 0 then
+			local suffix = (nChunks > 1) and ("_" .. ci) or ""
+			if writeOut(nil, "_" .. fileLabel .. suffix, toXML(packed)) then
+				aggregated = aggregated + 1
+			end
+		end
+		task.wait()
+	end
+
+	local idsName = (label == "ALL") and "_ids.txt" or ("_ids_" .. fileLabel .. ".txt")
+	local failName = (label == "ALL") and "_failed.txt" or ("_failed_" .. fileLabel .. ".txt")
+	ensureFolder(CFG.FOLDER)
+	pcall(writefile, CFG.FOLDER .. "/" .. idsName, table.concat(index, "\n"))
+	pcall(writefile, CFG.FOLDER .. "/" .. failName, table.concat(failed, "\n"))
+
+	local note = cancelFlag and " (dibatalin, partial)" or ""
+	setStatus(("selesai%s: %d ok, %d gagal -> %s/"):format(note, okN, #failed + wroteFail, CFG.FOLDER))
+	log(("%s: %d ok, %d gagal. File ada di %s/"):format(label, okN, #failed + wroteFail, CFG.FOLDER))
+	dumping = false
+end
+
+local function entriesFor(mode)
+	local r = {}
+	for _, e in ipairs(order) do
+		if not e.dead and inMode(e, mode) then
+			r[#r + 1] = e
+		end
+	end
+	return r
+end
+
+local function selectedEntries()
+	local r = {}
+	for _, e in ipairs(order) do
+		if e.sel and not e.dead then
+			r[#r + 1] = e
+		end
+	end
+	return r
+end
+
+local function dumpAll()
+	return dumpEntries(entriesFor("ALL"), "ALL")
+end
+
+local function dumpTargets()
+	local sel = selectedEntries()
+	if #sel > 0 then
+		return sel, "SELECTED"
+	end
+	local label = filterMode
+	if searchText ~= "" then
+		label = filterMode .. "_cari"
+	end
+	return currentView(), label
+end
+
+----------------------------------------------------------------
+-- Play (preview)
+----------------------------------------------------------------
 local function playId(id)
-	local char = lp.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	if not hum then
+	local animator = getAnimator(true)
+	if not animator then
 		return false, "karakter belum ada"
 	end
-	local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
 	local ks, err = loadSequence(id)
 	if not ks then
 		return false, err
 	end
 	local ok, res = pcall(function()
-		local hash = KSP:RegisterKeyframeSequence(ks)
 		local anim = Instance.new("Animation")
-		anim.AnimationId = hash
+		local hashOk, hash = pcall(function()
+			return KSP:RegisterKeyframeSequence(ks)
+		end)
+		anim.AnimationId = (hashOk and hash) or assetUrl(id)
 		local tr = animator:LoadAnimation(anim)
 		tr.Priority = Enum.AnimationPriority.Action
 		tr:Play()
@@ -179,31 +1332,908 @@ local function playId(id)
 end
 
 ----------------------------------------------------------------
--- Scanner
+-- Analisis GUI emote
 ----------------------------------------------------------------
-local function safeFullName(inst)
-	local ok, n = pcall(function()
-		return inst:GetFullName()
-	end)
-	return ok and n or inst.Name
+local function screenGuiOf(inst)
+	local cur, n = inst, 0
+	while cur and n < 40 do
+		if cur:IsA("LayerCollector") then
+			return cur
+		end
+		cur = cur.Parent
+		n = n + 1
+	end
+	return nil
 end
 
-local function add(rawId, name, source)
-	if not rawId or rawId == "" then
+local function guiVisible(inst)
+	local cur, n = inst, 0
+	while cur and n < 40 do
+		if cur:IsA("GuiObject") then
+			if not cur.Visible then
+				return false
+			end
+		elseif cur:IsA("LayerCollector") then
+			return cur.Enabled ~= false
+		end
+		cur = cur.Parent
+		n = n + 1
+	end
+	return true
+end
+
+-- konteks dari nama leluhur (nama terdekat yang nyebut dance/emote menang)
+local function ancestorCtx(inst)
+	if inst == nil then
+		return { emote = false }
+	end
+	local c = ctxCache[inst]
+	if c then
+		return c
+	end
+	local parentCtx
+	if inst:IsA("LayerCollector") or inst.Parent == nil then
+		parentCtx = { emote = false }
+	else
+		parentCtx = ancestorCtx(inst.Parent)
+	end
+	c = { emote = parentCtx.emote, cat = parentCtx.cat, how = parentCtx.how }
+	local k = ctxKind(inst.Name)
+	if k then
+		c.emote = true
+		if k == "dance" or k == "emote" then
+			c.cat = k
+			c.how = inst.Name
+		elseif not c.how then
+			c.how = inst.Name
+		end
+	end
+	ctxCache[inst] = c
+	return c
+end
+
+-- header section ("Dances", "Emotes") di antara saudara-saudara tombol
+local function headersOf(parent)
+	local h = headerCache[parent]
+	if h then
+		return h
+	end
+	h = {}
+	for _, c in ipairs(parent:GetChildren()) do
+		if c:IsA("GuiObject") and not c:IsA("GuiButton") then
+			local txt, hasBtn
+			if c:IsA("TextLabel") then
+				txt = c.Text
+			else
+				local kids = c:GetChildren()
+				if #kids <= 8 then
+					for _, k in ipairs(kids) do
+						if k:IsA("GuiButton") then
+							hasBtn = true
+							break
+						end
+						if k:IsA("TextLabel") and not txt then
+							txt = k.Text
+						end
+					end
+				end
+			end
+			if not hasBtn then
+				local kind = (txt and #txt <= 40 and ctxKind(stripTags(txt))) or ctxKind(c.Name)
+				if kind == "dance" or kind == "emote" then
+					local pos = c.AbsolutePosition
+					h[#h + 1] = { y = pos.Y, x = pos.X, cat = kind, text = txt or c.Name }
+				end
+			end
+		end
+	end
+	headerCache[parent] = h
+	return h
+end
+
+local function sectionCat(btn)
+	local node = btn
+	for _ = 1, 3 do
+		local parent = node.Parent
+		if not parent or parent:IsA("LayerCollector") then
+			break
+		end
+		local hs = headersOf(parent)
+		if #hs > 0 then
+			local pos = node.AbsolutePosition
+			local best
+			for _, hd in ipairs(hs) do
+				if hd.y <= pos.Y + 2 and (not best or hd.y > best.y or (hd.y == best.y and hd.x > best.x)) then
+					best = hd
+				end
+			end
+			if best then
+				return best.cat, best.text
+			end
+		end
+		node = parent
+	end
+	return nil
+end
+
+local function contextOf(btn)
+	local a = ancestorCtx(btn.Parent)
+	local ctx = { emote = a.emote, cat = a.cat, lv = a.cat and 3 or nil, how = a.how }
+	local ok, hc, ht = pcall(sectionCat, btn)
+	if ok and hc then
+		ctx.emote = true
+		ctx.cat = hc
+		ctx.lv = 3
+		ctx.how = ht
+	end
+	if not ctx.cat then
+		local sg = screenGuiOf(btn)
+		local tab = sg and activeTab[sg]
+		if tab and os.clock() - tab.t < 1800 and guiVisible(btn) then
+			ctx.emote = true
+			ctx.cat = tab.cat
+			ctx.lv = 2
+			ctx.how = "tab:" .. tab.cat
+		end
+	end
+	return ctx
+end
+
+-- tombol yang dibungkus cell (Frame isinya 1 tombol + label/value/animation)
+local function isCell(par, btn)
+	if not par or par:IsA("LayerCollector") or par:IsA("ScrollingFrame") then
+		return false
+	end
+	local kids = par:GetChildren()
+	if #kids > 12 then
+		return false
+	end
+	for _, k in ipairs(kids) do
+		if k:IsA("GuiButton") and k ~= btn then
+			return false
+		end
+	end
+	return true
+end
+
+local function labelOf(btn)
+	local txt = ""
+	if btn.ClassName == "TextButton" then
+		txt = guiLabelClean(btn.Text)
+	end
+	if txt == "" then
+		local ok, desc = pcall(btn.GetDescendants, btn)
+		if ok then
+			for i, d in ipairs(desc) do
+				if i > 30 then
+					break
+				end
+				if d.ClassName == "TextLabel" or d.ClassName == "TextButton" then
+					local t = guiLabelClean(d.Text)
+					if t ~= "" then
+						txt = t
+						break
+					end
+				end
+			end
+		end
+	end
+	local par = btn.Parent
+	local cell = isCell(par, btn)
+	if txt == "" and cell then
+		for _, k in ipairs(par:GetChildren()) do
+			if k.ClassName == "TextLabel" then
+				local t = guiLabelClean(k.Text)
+				if t ~= "" then
+					txt = t
+					break
+				end
+			end
+		end
+	end
+	if txt == "" then
+		txt = guiLabelClean(stripSuffix(btn.Name))
+	end
+	if txt == "" and cell then
+		txt = guiLabelClean(stripSuffix(par.Name))
+	end
+	return txt
+end
+
+local function lightInfo(btn)
+	local bi = btnInfo[btn]
+	if bi and bi.ctx then
+		return bi
+	end
+	bi = bi or {}
+	bi.label = bi.label or labelOf(btn)
+	bi.ctx = contextOf(btn)
+	btnInfo[btn] = bi
+	return bi
+end
+
+-- ---- ekstraksi ID dari tombol ---------------------------------------------
+local NAME_KEYS = { name = true, displayname = true, title = true, label = true, emotename = true, text = true }
+local CAT_KEYS = {
+	category = true, type = true, tab = true, group = true, genre = true,
+	section = true, kind = true, class = true, categoryname = true,
+}
+
+-- table data emote -> {id, st, name, cat}  (st = kekuatan bukti 1..3)
+local function itemFromTable(t)
+	local bestId, bestSt, name, cat
+	local n = 0
+	for k, v in pairs(t) do
+		n = n + 1
+		if n > 60 then
+			break
+		end
+		if type(k) == "string" then
+			local lk = k:lower()
+			local tv = type(v)
+			if NAME_KEYS[lk] and tv == "string" then
+				if not name then
+					name = v
+				end
+			elseif CAT_KEYS[lk] and tv == "string" then
+				local kind = ctxKind(v)
+				if kind == "dance" or kind == "emote" then
+					cat = kind
+				end
+			else
+				local st = idKeyStrength(k)
+				if st > 0 then
+					local id
+					if tv == "string" or tv == "number" then
+						id = parseIdMin(v, 5)
+					elseif typeof(v) == "Instance" and v:IsA("Animation") then
+						id = parseId(v.AnimationId)
+						st = 3
+					end
+					if id and (not bestSt or st > bestSt) then
+						bestId, bestSt = id, st
+					end
+				end
+			end
+		end
+	end
+	if not bestId then
+		return nil
+	end
+	return { id = bestId, st = bestSt, name = name, cat = cat }
+end
+
+local function pushCand(list, seen, id, st, how, name, cat)
+	if not id or seen[id] then
 		return
 	end
-	local id = tostring(rawId):match("%d+")
-	if not id or id == "0" or found[id] then
+	seen[id] = true
+	list[#list + 1] = { id = id, st = st, how = how, name = name, cat = cat }
+end
+
+local function scanAttrs(inst, list, seen, tag)
+	local ok, attrs = pcall(inst.GetAttributes, inst)
+	if not ok or type(attrs) ~= "table" then
 		return
 	end
-	local e = { id = id, name = name or "?", source = source or "?" }
-	found[id] = e
-	order[#order + 1] = e
-	if setCount then
-		setCount(#order)
+	for k, v in pairs(attrs) do
+		local st = idKeyStrength(k)
+		local tv = type(v)
+		if (tv == "string" or tv == "number") and st >= 0 then
+			if tv == "string" and v:lower():find("rbxassetid", 1, true) then
+				st = math.max(st, 2)
+			end
+			if st > 0 then
+				pushCand(list, seen, parseIdMin(v, 5), st, tag .. "@" .. tostring(k))
+			end
+		end
 	end
-	if addRow then
-		pcall(addRow, e)
+end
+
+local function scanValues(inst, list, seen, emoteCtx)
+	local ok, desc = pcall(inst.GetDescendants, inst)
+	if not ok then
+		return
+	end
+	for i, d in ipairs(desc) do
+		if i > 40 then
+			break
+		end
+		local cn = d.ClassName
+		if cn == "Animation" then
+			pushCand(list, seen, parseIdMin(d.AnimationId, 3), emoteCtx and 3 or 2, "anim")
+		elseif cn == "StringValue" or cn == "IntValue" or cn == "NumberValue" then
+			local st = idKeyStrength(d.Name)
+			if st >= 0 then
+				pushCand(list, seen, parseIdMin(d.Value, 5), st == 0 and 1 or st, "value")
+			end
+		elseif cn == "ObjectValue" then
+			local v = d.Value
+			if v and v.ClassName == "Animation" then
+				pushCand(list, seen, parseIdMin(v.AnimationId, 3), emoteCtx and 3 or 2, "objvalue")
+			end
+		end
+	end
+end
+
+local function normName(s)
+	return (tostring(s or ""):lower():gsub("[^%w]+", ""))
+end
+
+local function buildNameIndex()
+	nameIndex = {}
+	for _, e in ipairs(order) do
+		if e.inst and not e.dead and not isGenericName(e.name) then
+			local k = normName(stripSuffix(e.name))
+			if #k >= 3 then
+				local l = nameIndex[k]
+				if not l then
+					l = {}
+					nameIndex[k] = l
+				end
+				l[#l + 1] = e
+			end
+		end
+	end
+end
+
+local function linkByName(btn, bi, list, seen)
+	local keys = { normName(bi.label), normName(stripSuffix(btn.Name)) }
+	if btn.Parent then
+		keys[#keys + 1] = normName(stripSuffix(btn.Parent.Name))
+	end
+	for _, k in ipairs(keys) do
+		local l = (#k >= 3) and nameIndex[k] or nil
+		if l then
+			local pick, count = nil, 0
+			for _, e in ipairs(l) do
+				if not e.char and not e.move then
+					pick = e
+					count = count + 1
+				end
+			end
+			if count == 1 then
+				pushCand(list, seen, pick.id, 2, "name")
+				return
+			end
+		end
+	end
+end
+
+local inspectFunction
+local function inspectValue(v, list, seen, depth, how)
+	local tv = type(v)
+	if tv == "string" then
+		if v:lower():find("rbxassetid", 1, true) then
+			pushCand(list, seen, parseIdMin(v, 5), 2, how)
+		end
+	elseif tv == "function" then
+		if depth < 1 then
+			inspectFunction(v, list, seen, depth + 1, how)
+		end
+	elseif tv == "table" then
+		if depth < 2 then
+			local it = itemFromTable(v)
+			if it then
+				pushCand(list, seen, it.id, it.st, how .. ":tbl", it.name, it.cat)
+			else
+				-- koleksi: cuma dipercaya kalau isinya tepat 1 item (kalau banyak = ambigu)
+				local found1, count, n = nil, 0, 0
+				for _, x in pairs(v) do
+					n = n + 1
+					if n > 60 then
+						break
+					end
+					if type(x) == "table" then
+						local it2 = itemFromTable(x)
+						if it2 then
+							found1 = it2
+							count = count + 1
+						end
+					end
+				end
+				if count == 1 then
+					pushCand(list, seen, found1.id, found1.st, how .. ":tbl1", found1.name, found1.cat)
+				end
+			end
+		end
+	elseif typeof(v) == "Instance" then
+		if v:IsA("Animation") then
+			pushCand(list, seen, parseIdMin(v.AnimationId, 3), 3, how .. ":anim")
+		end
+	end
+end
+
+inspectFunction = function(f, list, seen, depth, how)
+	if getUps then
+		local okU, ups = pcall(getUps, f)
+		if okU and type(ups) == "table" then
+			if depth == 0 then
+				for _, v in pairs(ups) do
+					if v == SELF_TAG then
+						return -- handler punya kita sendiri
+					end
+				end
+			end
+			local n = 0
+			for _, v in pairs(ups) do
+				n = n + 1
+				if n > 40 then
+					break
+				end
+				pcall(inspectValue, v, list, seen, depth, how)
+			end
+		end
+	end
+	if depth == 0 and getConsts then
+		local okC, cs = pcall(getConsts, f)
+		if okC and type(cs) == "table" then
+			local n = 0
+			for _, v in pairs(cs) do
+				n = n + 1
+				if n > 200 then
+					break
+				end
+				if type(v) == "string" and v:lower():find("rbxassetid", 1, true) then
+					pushCand(list, seen, parseIdMin(v, 5), 2, how .. ":const")
+				end
+			end
+		end
+	end
+end
+
+local function scanConnections(btn, list, seen)
+	if not (getConns and (getUps or getConsts)) then
+		return
+	end
+	for _, sigName in ipairs({ "Activated", "MouseButton1Click" }) do
+		local ok, cs = pcall(function()
+			return getConns(btn[sigName])
+		end)
+		if ok and type(cs) == "table" then
+			for i, c in ipairs(cs) do
+				if i > 6 then
+					break
+				end
+				local f
+				pcall(function()
+					f = c.Function
+				end)
+				if type(f) == "function" then
+					pcall(inspectFunction, f, list, seen, 0, "conn")
+				end
+			end
+		end
+	end
+end
+
+local function extractCandidates(btn, ctx, bi)
+	local list, seen = {}, {}
+	pcall(scanAttrs, btn, list, seen, "attr")
+	pcall(scanValues, btn, list, seen, ctx.emote)
+	local par = btn.Parent
+	if isCell(par, btn) then
+		pcall(scanAttrs, par, list, seen, "cell")
+		pcall(scanValues, par, list, seen, ctx.emote)
+	end
+	if ctx.emote then
+		pcall(linkByName, btn, bi, list, seen)
+		if CFG.SCAN_CONNECTIONS then
+			pcall(scanConnections, btn, list, seen)
+		end
+	end
+	return list
+end
+
+local function addGuiEntry(id, bi, how, btn, cand)
+	local ctx = bi.ctx or { emote = true }
+	local cat, lv = ctx.cat, ctx.lv
+	if cand and cand.cat then
+		cat, lv = cand.cat, 3
+	end
+	local label = bi.label or ""
+	if cand and cand.name and guiLabelClean(cand.name) ~= "" then
+		label = guiLabelClean(cand.name)
+	end
+	return add(id, label ~= "" and label or "?", how .. ":" .. safeFullName(btn), {
+		gui = true,
+		guiName = label,
+		cat = cat,
+		lv = lv,
+	})
+end
+
+local function analyzeButton(btn)
+	local bi = { label = labelOf(btn) }
+	btnInfo[btn] = bi
+	bi.ctx = contextOf(btn)
+	local cands = extractCandidates(btn, bi.ctx, bi)
+	if #cands > 0 then
+		bi.ids = {}
+		local weakLeft = 3
+		for _, c in ipairs(cands) do
+			local accept = false
+			if c.st >= 3 then
+				accept = true
+			elseif bi.ctx.emote then
+				if c.st >= 2 then
+					accept = true
+				elseif weakLeft > 0 then
+					weakLeft = weakLeft - 1
+					accept = isAnimAsset(c.id)
+				end
+			end
+			if accept then
+				local e = addGuiEntry(c.id, bi, c.how, btn, c)
+				if e then
+					bi.ids[#bi.ids + 1] = c.id
+				end
+			end
+		end
+	end
+	bi.done = true
+	return bi
+end
+
+----------------------------------------------------------------
+-- Klik: tab terakhir + LEARN
+----------------------------------------------------------------
+-- pasangkan klik terakhir dengan animasi yang baru mulai (urutan boleh kebalik: track dulu baru klik)
+local function tryLearn()
+	local lc, lt = lastClick, lastTrack
+	if not (CFG.LEARN and lc and lt and lt.e and lc.btn and lc.btn.Parent) then
+		return false
+	end
+	if lt.t < lc.t - 0.3 or lt.t - lc.t > CFG.CLICK_WINDOW then
+		return false
+	end
+	local okI, bi = pcall(lightInfo, lc.btn)
+	if not (okI and bi and bi.ctx and (bi.ctx.emote or CFG.LEARN_ANY)) then
+		return false
+	end
+	lastClick, lastTrack = nil, nil
+	local useBi = bi
+	if not bi.ctx.emote then
+		useBi = { label = bi.label, ctx = { emote = true } }
+	end
+	local e = lt.e
+	if addGuiEntry(e.id, useBi, "click", lc.btn) then
+		bi.ids = bi.ids or {}
+		bi.ids[#bi.ids + 1] = e.id
+		setStatus("learn: " .. ((bi.label or "") ~= "" and bi.label or e.name) .. " -> " .. assetUrl(e.id))
+		return true
+	end
+	return false
+end
+
+local function requeueVisible(sg)
+	task.delay(0.4, function()
+		if not alive or not sg or not sg.Parent then
+			return
+		end
+		ctxCache = setmetatable({}, { __mode = "k" })
+		headerCache = setmetatable({}, { __mode = "k" })
+		for _, d in ipairs(sg:GetDescendants()) do
+			local cn = d.ClassName
+			if (cn == "TextButton" or cn == "ImageButton") and guiVisible(d) then
+				btnInfo[d] = nil
+				if not queuedBtn[d] then
+					queuedBtn[d] = true
+					btnQueue[#btnQueue + 1] = d
+				end
+			end
+		end
+	end)
+end
+
+local function onButtonClick(btn)
+	if not alive then
+		return
+	end
+	local okAll = pcall(function()
+		local bi = btnInfo[btn]
+		local raw = ""
+		if btn.ClassName == "TextButton" then
+			raw = trim(stripTags(btn.Text))
+		end
+		if raw == "" then
+			raw = btn.Name
+		end
+		local kind = ctxKind(raw)
+		local isItem = bi and bi.ids and #bi.ids > 0
+		if (kind == "dance" or kind == "emote") and not isItem and #raw <= 24 then
+			local sg = screenGuiOf(btn)
+			if sg then
+				activeTab[sg] = { cat = kind, t = os.clock() }
+				lastClick = nil
+				requeueVisible(sg)
+			end
+		else
+			lastClick = { btn = btn, t = os.clock() }
+			tryLearn()
+		end
+	end)
+	if not okAll then
+		lastClick = nil
+	end
+end
+
+local function queueButton(btn, force)
+	if not CFG.SCAN_GUI or isOwnGui(btn) then
+		return
+	end
+	if not hooked[btn] then
+		hooked[btn] = true
+		keep(btn.Activated:Connect(function()
+			local _ = SELF_TAG
+			onButtonClick(btn)
+		end))
+	end
+	if queuedBtn[btn] and not force then
+		return
+	end
+	queuedBtn[btn] = true
+	btnQueue[#btnQueue + 1] = btn
+end
+
+local function queueAllButtons(force)
+	if not playerGui then
+		return 0
+	end
+	local n = 0
+	local ok, desc = pcall(playerGui.GetDescendants, playerGui)
+	if not ok then
+		return 0
+	end
+	for i, d in ipairs(desc) do
+		local cn = d.ClassName
+		if cn == "TextButton" or cn == "ImageButton" then
+			if force then
+				btnInfo[d] = nil
+			end
+			queueButton(d, force)
+			n = n + 1
+		end
+		if i % 1500 == 0 then
+			task.wait()
+		end
+	end
+	return n
+end
+
+local function waitQueueDrain(timeout)
+	local t0 = os.clock()
+	while alive and (#btnQueue > 0 or workerBusy) and os.clock() - t0 < timeout do
+		task.wait(0.1)
+	end
+end
+
+----------------------------------------------------------------
+-- Bukti dari instance Animation (folder Animate, folder emote, dll)
+----------------------------------------------------------------
+local MOVE_NAMES = {
+	idle = true, walk = true, run = true, jump = true, fall = true, climb = true, swim = true,
+	swimidle = true, sit = true, toolnone = true, toolslash = true, toollunge = true, mood = true, landed = true,
+}
+local EMOTE_FOLDERS = {
+	wave = "emote", point = "emote", laugh = "emote", cheer = "emote",
+	dance = "dance", dance1 = "dance", dance2 = "dance", dance3 = "dance",
+}
+local LIST_ROOTS = {
+	ReplicatedStorage = true, ReplicatedFirst = true, StarterGui = true, StarterPlayer = true,
+	StarterPack = true, Lighting = true,
+}
+
+local function animEvidence(inst)
+	local char, move, folderCat, kindCat, listRoot = false, false, nil, nil, false
+	local cur, top, n = inst.Parent, nil, 0
+	while cur and cur ~= game and n < 24 do
+		n = n + 1
+		local nm = cur.Name
+		local ln = nm:lower()
+		if MOVE_NAMES[ln] then
+			move = true
+		end
+		if EMOTE_FOLDERS[ln] and not folderCat then
+			folderCat = EMOTE_FOLDERS[ln]
+		end
+		if ln == "animate" then
+			char = true
+		end
+		if not char and cur.ClassName == "Model" and cur:FindFirstChildOfClass("Humanoid") then
+			char = true
+		end
+		if cur.ClassName == "PlayerGui" then
+			listRoot = true
+		end
+		local k = ctxKind(nm)
+		if k and not kindCat then
+			kindCat = k
+		end
+		top = cur
+		cur = cur.Parent
+	end
+	if top and LIST_ROOTS[top.ClassName] then
+		listRoot = true
+	end
+	if cur == nil and top then
+		listRoot = true -- tree nil-parent (getnilinstances)
+	end
+	local ev = {}
+	if char then
+		ev.char = true
+		if folderCat then
+			ev.cat = folderCat
+			ev.lv = 2
+		end
+	end
+	if move then
+		ev.move = true
+	end
+	if not char and listRoot and kindCat then
+		ev.gui = true
+		if kindCat == "dance" or kindCat == "emote" then
+			ev.cat = kindCat
+			ev.lv = 2
+		end
+	end
+	return ev
+end
+
+----------------------------------------------------------------
+-- Emote wheel bawaan + data module
+----------------------------------------------------------------
+local function scanNative()
+	if not CFG.SCAN_NATIVE then
+		return 0
+	end
+	local hum = getHumanoid()
+	if not hum then
+		return 0
+	end
+	local desc
+	pcall(function()
+		desc = hum:GetAppliedDescription()
+	end)
+	if not desc then
+		desc = hum:FindFirstChildOfClass("HumanoidDescription")
+	end
+	if not desc then
+		return 0
+	end
+	local okE, emotes = pcall(function()
+		return desc:GetEmotes()
+	end)
+	local okQ, equipped = pcall(function()
+		return desc:GetEquippedEmotes()
+	end)
+	local slotOf = {}
+	if okQ and type(equipped) == "table" then
+		for _, it in ipairs(equipped) do
+			if type(it) == "table" and it.Name then
+				slotOf[it.Name] = it.Slot
+			end
+		end
+	end
+	local n = 0
+	if okE and type(emotes) == "table" then
+		for name, ids in pairs(emotes) do
+			local raw = ids
+			if type(ids) == "table" then
+				raw = ids[1]
+			end
+			local slot = slotOf[name]
+			local inWheel = slot ~= nil
+			local e = add(raw, name, inWheel and ("wheel#" .. tostring(slot)) or "emote:owned", {
+				gui = inWheel or CFG.OWNED_EMOTES_AS_GUI,
+				guiName = name,
+				cat = "emote",
+				lv = 0.5,
+				slot = slot,
+				native = name,
+			})
+			if e then
+				n = n + 1
+			end
+		end
+	end
+	return n
+end
+
+local function addDataEntry(it, cat, src)
+	local c = it.cat or cat
+	local accept = it.st >= 2
+	if not accept then
+		accept = isAnimAsset(it.id) -- ID lemah (cuma "Id") harus lolos cek katalog
+	end
+	if not accept then
+		return
+	end
+	add(it.id, it.name or "?", "data:" .. src, {
+		gui = true,
+		guiName = it.name,
+		cat = c,
+		lv = c and 3 or nil,
+	})
+end
+
+local function walkData(t, cat, depth, visited, budget, src)
+	if depth > 7 or budget.n <= 0 or visited[t] then
+		return
+	end
+	visited[t] = true
+	budget.n = budget.n - 1
+	local it = itemFromTable(t)
+	if it then
+		addDataEntry(it, cat, src)
+		return
+	end
+	for k, v in pairs(t) do
+		if budget.n <= 0 then
+			return
+		end
+		local tv = type(v)
+		if tv == "table" then
+			local kcat = cat
+			if type(k) == "string" then
+				local kk = ctxKind(k)
+				if kk == "dance" or kk == "emote" then
+					kcat = kk
+				end
+			end
+			walkData(v, kcat, depth + 1, visited, budget, src)
+		elseif type(k) == "string" and (tv == "string" or tv == "number") and idKeyStrength(k) == 0 then
+			-- bentuk peta: ["Floss"] = 1234567890
+			local id = parseIdMin(v, 6)
+			if id then
+				budget.n = budget.n - 1
+				addDataEntry({ id = id, st = 2, name = k }, cat, src)
+			end
+		end
+	end
+end
+
+local function scanModules()
+	if not CFG.SCAN_MODULES or not getMods then
+		return 0
+	end
+	local ok, mods = pcall(getMods)
+	if not ok or type(mods) ~= "table" then
+		return 0
+	end
+	local before = #order
+	for i, m in ipairs(mods) do
+		if not alive then
+			break
+		end
+		local full = safeFullName(m)
+		local kind = ctxKind(full)
+		if kind and not isOwnGui(m) then
+			local okr, res = pcall(require, m)
+			if okr and type(res) == "table" then
+				local cat = (kind == "dance" or kind == "emote") and kind or nil
+				pcall(walkData, res, cat, 0, {}, { n = 6000 }, full)
+			end
+		end
+		if i % 20 == 0 then
+			task.wait()
+		end
+	end
+	return #order - before
+end
+
+----------------------------------------------------------------
+-- Scanner (instance Animation + Animator)
+----------------------------------------------------------------
+local function onTrack(animator, track, fromEvent)
+	local anim = track.Animation
+	if not anim then
+		return
+	end
+	local e = add(anim.AnimationId, track.Name, "played@" .. safeFullName(animator))
+	if fromEvent and e and not e.move and isLocalAnimator(animator) then
+		lastTrack = { e = e, t = os.clock() }
+		tryLearn()
 	end
 end
 
@@ -213,35 +2243,358 @@ local function watchAnimator(animator)
 	end
 	animators[animator] = true
 	keep(animator.AnimationPlayed:Connect(function(track)
-		local anim = track.Animation
-		if anim then
-			add(anim.AnimationId, track.Name, "played@" .. safeFullName(animator))
-		end
+		pcall(onTrack, animator, track, true)
 	end))
 end
 
 local function onInstance(inst)
-	if inst:IsA("Animation") then
-		add(inst.AnimationId, inst.Name, safeFullName(inst))
+	local cn = inst.ClassName
+	if cn == "Animation" then
+		local e = add(inst.AnimationId, inst.Name, safeFullName(inst), animEvidence(inst))
+		if e then
+			e.inst = true
+		end
 		keep(inst:GetPropertyChangedSignal("AnimationId"):Connect(function()
-			add(inst.AnimationId, inst.Name, safeFullName(inst))
+			local e2 = add(inst.AnimationId, inst.Name, safeFullName(inst), animEvidence(inst))
+			if e2 then
+				e2.inst = true
+			end
 		end))
-	elseif inst:IsA("Animator") then
+	elseif cn == "Animator" then
 		watchAnimator(inst)
+	elseif CFG.SCAN_GUI and (cn == "TextButton" or cn == "ImageButton") then
+		local pg = playerGui
+		if pg and inst:IsDescendantOf(pg) then
+			task.delay(0.3, function()
+				if alive and inst.Parent then
+					queueButton(inst)
+				end
+			end)
+		end
 	end
+end
+
+----------------------------------------------------------------
+-- Scan ulang + AUTO
+----------------------------------------------------------------
+local function countGui()
+	local d, em, g = 0, 0, 0
+	for _, e in ipairs(order) do
+		if not e.dead and e.inGui then
+			g = g + 1
+			if catOf(e) == "dance" then
+				d = d + 1
+			else
+				em = em + 1
+			end
+		end
+	end
+	return g, d, em
+end
+
+local function rescan()
+	if scanning then
+		return
+	end
+	scanning = true
+	task.spawn(function()
+		setStatus("scan emote GUI...")
+		local ok, err = pcall(function()
+			ctxCache = setmetatable({}, { __mode = "k" })
+			headerCache = setmetatable({}, { __mode = "k" })
+			buildNameIndex()
+			scanNative()
+			if CFG.SCAN_GUI then
+				queueAllButtons(true)
+			end
+			scanModules()
+			waitQueueDrain(25)
+		end)
+		local g, d, em = countGui()
+		if ok then
+			setStatus(("scan selesai: GUI %d (dance %d / emote %d)"):format(g, d, em))
+		else
+			setStatus("scan error: " .. tostring(err):sub(1, 60))
+		end
+		markDirty()
+		scanning = false
+	end)
+end
+
+local BLACK = {}
+for w in
+	("buy purchase robux shop store gamepass pass close exit cancel stop setting settings search clear delete remove report trade gift donate redeem premium vip favorite favourite fav star heart like equip unequip bind keybind assign save edit rename reset")
+		:gmatch("%S+")
+do
+	BLACK[w] = true
+end
+
+local function isBlacklisted(btn, bi)
+	for _, src in ipairs({ bi.label or "", btn.Name, btn.Parent and btn.Parent.Name or "" }) do
+		for _, t in ipairs(tokens(src)) do
+			if BLACK[t] then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function snapshotTracks(animator)
+	local set = {}
+	local ok, tracks = pcall(function()
+		return animator:GetPlayingAnimationTracks()
+	end)
+	if ok and type(tracks) == "table" then
+		for _, t in ipairs(tracks) do
+			set[t] = true
+		end
+	end
+	return set
+end
+
+-- nunggu track baru (bukan idle/walk) muncul di animator
+local function waitNewTrack(animator, before, timeout)
+	local t0 = os.clock()
+	while alive and not cancelFlag and os.clock() - t0 < timeout do
+		local ok, tracks = pcall(function()
+			return animator:GetPlayingAnimationTracks()
+		end)
+		if ok and type(tracks) == "table" then
+			for _, tr in ipairs(tracks) do
+				if not before[tr] then
+					local anim = tr.Animation
+					local id = anim and parseId(anim.AnimationId)
+					local known = id and found[id]
+					if id and not (known and known.move) then
+						return tr
+					end
+					before[tr] = true
+				end
+			end
+		end
+		task.wait(0.05)
+	end
+	return nil
+end
+
+local function fireButton(btn)
+	local fired = false
+	if getConns then
+		for _, sigName in ipairs({ "Activated", "MouseButton1Click" }) do
+			local ok, cs = pcall(function()
+				return getConns(btn[sigName])
+			end)
+			if ok and type(cs) == "table" then
+				for _, c in ipairs(cs) do
+					local okf = pcall(function()
+						c:Fire()
+					end)
+					if not okf then
+						pcall(function()
+							c.Function()
+						end)
+					end
+					fired = true
+				end
+			end
+		end
+	end
+	if not fired and fireSig then
+		fired = pcall(fireSig, btn.Activated)
+	end
+	return fired
+end
+
+local function autoWork()
+	local animator, hum = getAnimator(false)
+	if not animator then
+		setStatus("auto: karakter / animator belum ada")
+		return
+	end
+	if not (getConns or fireSig) then
+		setStatus("auto: executor ga punya getconnections / firesignal")
+	end
+	setStatus("auto: scan dulu...")
+	scanNative()
+	if CFG.SCAN_GUI then
+		queueAllButtons(true)
+		waitQueueDrain(25)
+	end
+	local newCount, clicks = 0, 0
+
+	-- 1. emote wheel yang ID-nya ga bisa di-load langsung -> tarik lewat PlayEmote
+	if hum then
+		local list = {}
+		for _, e in ipairs(order) do
+			if e.native and not e.dead and not e.nativeTried then
+				list[#list + 1] = e
+			end
+		end
+		for i, e in ipairs(list) do
+			if cancelFlag or not alive then
+				break
+			end
+			e.nativeTried = true
+			if not fetchData(e.id) then
+				setStatus(("auto: PlayEmote %d/%d %s"):format(i, #list, tostring(e.native)))
+				local before = snapshotTracks(animator)
+				pcall(function()
+					hum:PlayEmote(e.native)
+				end)
+				local tr = waitNewTrack(animator, before, CFG.AUTO_WAIT + 0.6)
+				if tr and tr.Animation then
+					local nid = parseId(tr.Animation.AnimationId)
+					if nid and nid ~= e.id then
+						add(nid, e.native, "wheel>" .. tostring(e.native), {
+							gui = e.inGui == true,
+							guiName = e.guiName or e.native,
+							cat = e.cat,
+							lv = e.catLv,
+							slot = e.slot,
+							native = e.native,
+						})
+						e.dead = true
+						newCount = newCount + 1
+					end
+				end
+				if tr then
+					pcall(function()
+						tr:Stop(0.1)
+					end)
+				end
+				task.wait(CFG.AUTO_GAP)
+			end
+		end
+	end
+
+	-- 2. klik otomatis tombol emote di GUI
+	local targets = {}
+	for btn, bi in pairs(btnInfo) do
+		if
+			bi.ctx
+			and bi.ctx.emote
+			and btn.Parent
+			and not (bi.ids and #bi.ids > 0)
+			and not isOwnGui(btn)
+			and not isBlacklisted(btn, bi)
+		then
+			local raw = btn.ClassName == "TextButton" and trim(stripTags(btn.Text)) or ""
+			local kind = ctxKind(raw ~= "" and raw or btn.Name)
+			if not ((kind == "dance" or kind == "emote") and #raw <= 24) then -- skip tombol tab
+				targets[#targets + 1] = btn
+			end
+		end
+	end
+	table.sort(targets, function(a, b)
+		return safeFullName(a) < safeFullName(b)
+	end)
+	if #targets > CFG.AUTO_MAX then
+		for i = #targets, CFG.AUTO_MAX + 1, -1 do
+			targets[i] = nil
+		end
+	end
+	for i, btn in ipairs(targets) do
+		if cancelFlag or not alive then
+			break
+		end
+		local bi = btnInfo[btn]
+		if bi and btn.Parent then
+			setStatus(("auto: klik %d/%d %s"):format(i, #targets, bi.label ~= "" and bi.label or btn.Name))
+			local before = snapshotTracks(animator)
+			if fireButton(btn) then
+				clicks = clicks + 1
+				local tr = waitNewTrack(animator, before, CFG.AUTO_WAIT)
+				if tr and tr.Animation then
+					local id = parseId(tr.Animation.AnimationId)
+					if id then
+						local isNew = found[id] == nil or not found[id].inGui
+						if addGuiEntry(id, bi, "auto", btn) then
+							bi.ids = bi.ids or {}
+							bi.ids[#bi.ids + 1] = id
+							if isNew then
+								newCount = newCount + 1
+							end
+						end
+					end
+					pcall(function()
+						tr:Stop(0.1)
+					end)
+				end
+				task.wait(CFG.AUTO_GAP)
+			end
+		end
+	end
+	local g, d, em = countGui()
+	setStatus(("auto selesai: %d klik, +%d emote baru | GUI %d (dance %d / emote %d)"):format(clicks, newCount, g, d, em))
+	markDirty()
+end
+
+local function autoClick()
+	if autoRunning then
+		cancelFlag = true
+		setStatus("auto: dihentikan")
+		return
+	end
+	autoRunning = true
+	cancelFlag = false
+	if ui.autoBtn then
+		ui.autoBtn.Text = "AUTO..."
+	end
+	task.spawn(function()
+		local ok, err = pcall(autoWork)
+		autoRunning = false
+		if ui.autoBtn then
+			ui.autoBtn.Text = "AUTO"
+		end
+		if not ok then
+			setStatus("auto error: " .. tostring(err):sub(1, 70))
+		end
+	end)
 end
 
 ----------------------------------------------------------------
 -- UI
 ----------------------------------------------------------------
-local gui = Instance.new("ScreenGui")
-gui.Name = "AnimRip"
-gui.ResetOnSpawn = false
-gui.DisplayOrder = 999
-if not pcall(function()
-	gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
-end) then
-	gui.Parent = lp:WaitForChild("PlayerGui")
+local COL = {
+	bg = Color3.fromRGB(24, 24, 30),
+	panel = Color3.fromRGB(16, 16, 20),
+	row = Color3.fromRGB(34, 34, 44),
+	chipOff = Color3.fromRGB(46, 46, 60),
+	chipOn = Color3.fromRGB(70, 110, 200),
+	green = Color3.fromRGB(50, 120, 80),
+	red = Color3.fromRGB(150, 50, 50),
+	darkRed = Color3.fromRGB(120, 60, 60),
+	purple = Color3.fromRGB(90, 70, 130),
+	blue = Color3.fromRGB(50, 90, 150),
+	grey = Color3.fromRGB(70, 70, 90),
+	orange = Color3.fromRGB(170, 100, 40),
+	dance = Color3.fromRGB(176, 96, 232),
+	emote = Color3.fromRGB(60, 172, 204),
+	other = Color3.fromRGB(92, 92, 104),
+}
+
+local function catColor(e)
+	local c = catOf(e)
+	if c == "dance" then
+		return COL.dance
+	elseif c == "emote" then
+		return COL.emote
+	end
+	return COL.other
+end
+
+local function tagOf(e)
+	local c = catOf(e)
+	if e.inGui then
+		return c == "dance" and "GUI DANCE" or "GUI EMOTE"
+	end
+	if c == "dance" then
+		return "DANCE"
+	elseif c == "emote" then
+		return "EMOTE"
+	end
+	return ""
 end
 
 local function corner(inst, r)
@@ -265,67 +2618,143 @@ local function mkButton(parent, text, pos, size, color)
 	return b
 end
 
-local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(340, 320)
-main.Position = UDim2.new(0.5, -170, 0, 40)
-main.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
-main.BorderSizePixel = 0
-main.Parent = gui
-corner(main, 8)
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -190, 0, 30)
-title.Position = UDim2.fromOffset(10, 0)
-title.BackgroundTransparency = 1
-title.Text = "Anim ID Dump (0)"
-title.TextColor3 = Color3.fromRGB(235, 235, 245)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = main
-
-local allBtn = mkButton(main, "DUMP ALL", UDim2.new(1, -184, 0, 4), UDim2.fromOffset(66, 22), Color3.fromRGB(50, 120, 80))
-local stopBtn = mkButton(main, "STOP", UDim2.new(1, -114, 0, 4), UDim2.fromOffset(40, 22), Color3.fromRGB(120, 60, 60))
-local clrBtn = mkButton(main, "CLR", UDim2.new(1, -70, 0, 4), UDim2.fromOffset(32, 22), Color3.fromRGB(70, 70, 90))
-local closeBtn = mkButton(main, "X", UDim2.new(1, -34, 0, 4), UDim2.fromOffset(28, 22), Color3.fromRGB(150, 50, 50))
-
-local list = Instance.new("ScrollingFrame")
-list.Position = UDim2.fromOffset(6, 34)
-list.Size = UDim2.new(1, -12, 1, -62)
-list.BackgroundColor3 = Color3.fromRGB(16, 16, 20)
-list.BorderSizePixel = 0
-list.ScrollBarThickness = 4
-list.CanvasSize = UDim2.new()
-list.AutomaticCanvasSize = Enum.AutomaticSize.Y
-list.Parent = main
-corner(list, 6)
-
-local layout = Instance.new("UIListLayout")
-layout.Padding = UDim.new(0, 4)
-layout.Parent = list
-
-local status = Instance.new("TextLabel")
-status.Position = UDim2.new(0, 10, 1, -24)
-status.Size = UDim2.new(1, -20, 0, 20)
-status.BackgroundTransparency = 1
-status.Text = "nunggu animasi ketemu..."
-status.TextColor3 = Color3.fromRGB(160, 160, 175)
-status.Font = Enum.Font.Gotham
-status.TextSize = 11
-status.TextXAlignment = Enum.TextXAlignment.Left
-status.TextTruncate = Enum.TextTruncate.AtEnd
-status.Parent = main
-
-setStatus = function(t)
-	status.Text = t
+local function mkRow(parent, y)
+	local f = Instance.new("Frame")
+	f.BackgroundTransparency = 1
+	f.Position = UDim2.fromOffset(6, y)
+	f.Size = UDim2.new(1, -12, 0, 22)
+	f.Parent = parent
+	local l = Instance.new("UIListLayout")
+	l.FillDirection = Enum.FillDirection.Horizontal
+	l.Padding = UDim.new(0, 4)
+	l.SortOrder = Enum.SortOrder.LayoutOrder
+	l.Parent = f
+	return f
 end
 
-setCount = function(n)
-	title.Text = "Anim ID Dump (" .. n .. ")"
-end
+local function buildGui()
+	local g = Instance.new("ScreenGui")
+	g.Name = "AnimRip"
+	g.ResetOnSpawn = false
+	g.DisplayOrder = 999
+	if not pcall(function()
+		g.Parent = (gethui and gethui()) or CoreGui or error("no CoreGui")
+	end) then
+		g.Parent = lp:WaitForChild("PlayerGui")
+	end
+	gui = g
 
--- drag lewat title (mouse & touch)
-do
+	local W, H = 430, 372
+	local main = Instance.new("Frame")
+	main.Size = UDim2.fromOffset(W, H)
+	main.Position = UDim2.new(0.5, -W / 2, 0, 24)
+	main.BackgroundColor3 = COL.bg
+	main.BorderSizePixel = 0
+	main.Parent = g
+	corner(main, 8)
+	ui.main = main
+	if CFG.UI_SCALE ~= 1 then
+		local sc = Instance.new("UIScale")
+		sc.Scale = CFG.UI_SCALE
+		sc.Parent = main
+	end
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -76, 0, 28)
+	title.Position = UDim2.fromOffset(10, 0)
+	title.BackgroundTransparency = 1
+	title.Text = "Anim Dump v2"
+	title.TextColor3 = Color3.fromRGB(235, 235, 245)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 13
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextTruncate = Enum.TextTruncate.AtEnd
+	title.Parent = main
+	ui.title = title
+
+	ui.minBtn = mkButton(main, "-", UDim2.new(1, -66, 0, 3), UDim2.fromOffset(28, 22), COL.grey)
+	ui.closeBtn = mkButton(main, "X", UDim2.new(1, -34, 0, 3), UDim2.fromOffset(28, 22), COL.red)
+
+	local body = Instance.new("Frame")
+	body.BackgroundTransparency = 1
+	body.Position = UDim2.fromOffset(0, 28)
+	body.Size = UDim2.new(1, 0, 1, -28)
+	body.Parent = main
+	ui.body = body
+
+	-- baris 1: filter
+	ui.chipRow = mkRow(body, 2)
+	for _, name in ipairs({ "ALL", "GUI", "DANCE", "EMOTE", "LAIN" }) do
+		local label = (name == "ALL") and "SEMUA" or name
+		local b = mkButton(ui.chipRow, label, UDim2.new(), UDim2.new(0.2, -3, 1, 0), COL.chipOff)
+		ui.chips[name] = b
+		keep(b.Activated:Connect(function()
+			filterMode = name
+			markDirty()
+		end))
+	end
+
+	-- baris 2: search + aksi scan
+	local row2 = mkRow(body, 28)
+	local search = Instance.new("TextBox")
+	search.Size = UDim2.new(0, 112, 1, 0)
+	search.BackgroundColor3 = COL.row
+	search.BorderSizePixel = 0
+	search.TextColor3 = Color3.fromRGB(230, 230, 240)
+	search.PlaceholderText = "cari nama / id"
+	search.PlaceholderColor3 = Color3.fromRGB(120, 120, 135)
+	search.Text = ""
+	search.ClearTextOnFocus = false
+	search.Font = Enum.Font.Gotham
+	search.TextSize = 11
+	search.TextXAlignment = Enum.TextXAlignment.Left
+	search.Parent = row2
+	corner(search, 5)
+	ui.search = search
+	ui.scanBtn = mkButton(row2, "SCAN", UDim2.new(), UDim2.fromOffset(46, 22), COL.blue)
+	ui.autoBtn = mkButton(row2, "AUTO", UDim2.new(), UDim2.fromOffset(52, 22), COL.orange)
+	ui.learnBtn = mkButton(row2, "LEARN", UDim2.new(), UDim2.fromOffset(58, 22), COL.green)
+	ui.fmtBtn = mkButton(row2, ".RBXMX", UDim2.new(), UDim2.fromOffset(64, 22), COL.grey)
+
+	-- baris 3: seleksi + dump
+	local row3 = mkRow(body, 54)
+	ui.selBtn = mkButton(row3, "SEL", UDim2.new(), UDim2.fromOffset(40, 22), COL.grey)
+	ui.clrBtn = mkButton(row3, "CLR", UDim2.new(), UDim2.fromOffset(40, 22), COL.grey)
+	ui.dumpBtn = mkButton(row3, "DUMP", UDim2.new(), UDim2.fromOffset(120, 22), COL.green)
+	ui.allBtn = mkButton(row3, "DUMP ALL", UDim2.new(), UDim2.fromOffset(72, 22), COL.blue)
+	ui.stopBtn = mkButton(row3, "STOP", UDim2.new(), UDim2.fromOffset(46, 22), COL.darkRed)
+
+	local list = Instance.new("ScrollingFrame")
+	list.Position = UDim2.fromOffset(6, 82)
+	list.Size = UDim2.new(1, -12, 1, -108)
+	list.BackgroundColor3 = COL.panel
+	list.BorderSizePixel = 0
+	list.ScrollBarThickness = 4
+	list.CanvasSize = UDim2.new()
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.Parent = body
+	corner(list, 6)
+	ui.list = list
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 3)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = list
+
+	local status = Instance.new("TextLabel")
+	status.Position = UDim2.new(0, 10, 1, -22)
+	status.Size = UDim2.new(1, -20, 0, 18)
+	status.BackgroundTransparency = 1
+	status.Text = "nunggu animasi ketemu..."
+	status.TextColor3 = Color3.fromRGB(160, 160, 175)
+	status.Font = Enum.Font.Gotham
+	status.TextSize = 11
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.TextTruncate = Enum.TextTruncate.AtEnd
+	status.Parent = body
+	ui.status = status
+
+	-- drag lewat title (mouse & touch)
 	local dragging, startInput, startPos
 	keep(title.InputBegan:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
@@ -342,35 +2771,48 @@ do
 		end
 	end))
 	keep(UIS.InputChanged:Connect(function(i)
-		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+		if
+			dragging
+			and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch)
+		then
 			local d = i.Position - startInput
-			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+			main.Position =
+				UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
 		end
+	end))
+
+	local minimized = false
+	keep(ui.minBtn.Activated:Connect(function()
+		minimized = not minimized
+		body.Visible = not minimized
+		main.Size = minimized and UDim2.fromOffset(W, 28) or UDim2.fromOffset(W, H)
+		ui.minBtn.Text = minimized and "+" or "-"
 	end))
 end
 
-addRow = function(e)
-	if rowCount >= MAX_ROWS then
-		if rowCount == MAX_ROWS then
-			rowCount = rowCount + 1
-			setStatus("list GUI penuh (" .. MAX_ROWS .. "), sisanya tetap ikut DUMP ALL")
-		end
-		return
-	end
-	rowCount = rowCount + 1
-
+local builtRows = 0
+local function buildRow(e)
 	local row = Instance.new("Frame")
-	row.Size = UDim2.new(1, -6, 0, 44)
-	row.BackgroundColor3 = Color3.fromRGB(34, 34, 44)
+	row.Size = UDim2.new(1, -6, 0, 42)
+	row.BackgroundColor3 = COL.row
 	row.BorderSizePixel = 0
-	row.Parent = list
+	row.Parent = ui.list
 	corner(row, 5)
+	builtRows = builtRows + 1
+
+	local stripe = Instance.new("Frame")
+	stripe.Size = UDim2.new(0, 3, 1, -10)
+	stripe.Position = UDim2.fromOffset(3, 5)
+	stripe.BorderSizePixel = 0
+	stripe.Parent = row
+	corner(stripe, 2)
+
+	local chk = mkButton(row, "", UDim2.new(0, 10, 0.5, -10), UDim2.fromOffset(20, 20), COL.chipOff)
 
 	local lbl = Instance.new("TextLabel")
-	lbl.Position = UDim2.fromOffset(6, 2)
-	lbl.Size = UDim2.new(1, -128, 1, -4)
+	lbl.Position = UDim2.fromOffset(34, 2)
+	lbl.Size = UDim2.new(1, -176, 1, -4)
 	lbl.BackgroundTransparency = 1
-	lbl.Text = e.name .. "\n" .. e.id
 	lbl.TextColor3 = Color3.fromRGB(220, 220, 230)
 	lbl.Font = Enum.Font.Gotham
 	lbl.TextSize = 11
@@ -378,51 +2820,250 @@ addRow = function(e)
 	lbl.TextTruncate = Enum.TextTruncate.AtEnd
 	lbl.Parent = row
 
-	local playB = mkButton(row, "PLAY", UDim2.new(1, -118, 0.5, -12), UDim2.fromOffset(52, 24), Color3.fromRGB(50, 90, 150))
-	local copyB = mkButton(row, "COPY", UDim2.new(1, -62, 0.5, -12), UDim2.fromOffset(56, 24), Color3.fromRGB(50, 120, 80))
+	local copyB = mkButton(row, "COPY", UDim2.new(1, -138, 0.5, -12), UDim2.fromOffset(40, 24), COL.purple)
+	local playB = mkButton(row, "PLAY", UDim2.new(1, -94, 0.5, -12), UDim2.fromOffset(40, 24), COL.blue)
+	local saveB = mkButton(row, "SAVE", UDim2.new(1, -50, 0.5, -12), UDim2.fromOffset(44, 24), COL.green)
+
+	local lastTxt
+	local function refresh()
+		local tag = tagOf(e)
+		local txt = (tag ~= "" and ("[" .. tag .. "] ") or "")
+			.. dispName(e)
+			.. "\n"
+			.. assetUrl(e.id)
+			.. "  |  "
+			.. tostring(e.source or ""):sub(1, 40)
+		if txt ~= lastTxt then
+			lastTxt = txt
+			lbl.Text = txt
+		end
+		stripe.BackgroundColor3 = catColor(e)
+		chk.BackgroundColor3 = e.sel and COL.green or COL.chipOff
+		chk.Text = e.sel and "+" or ""
+	end
+	e.row = row
+	e.refresh = refresh
+	refresh()
+	if not e.realName then
+		queueName(e, refresh)
+	end
+
+	keep(chk.Activated:Connect(function()
+		e.sel = not e.sel
+		refresh()
+		markDirty()
+	end))
+
+	keep(copyB.Activated:Connect(function()
+		local url = assetUrl(e.id)
+		local clip = setclipboard or toclipboard
+		if type(clip) == "function" and pcall(clip, url) then
+			setStatus("disalin: " .. url)
+		else
+			setStatus(url .. " (executor ga punya setclipboard)")
+		end
+	end))
 
 	keep(playB.Activated:Connect(function()
 		task.spawn(function()
 			setStatus("load animasi...")
 			local ok, err = playId(e.id)
-			setStatus(ok and ("playing: " .. e.name) or ("gagal play: " .. tostring(err):sub(1, 60)))
+			setStatus(ok and ("playing: " .. dispName(e)) or ("gagal play: " .. tostring(err):sub(1, 60)))
 		end)
 	end))
 
-	keep(copyB.Activated:Connect(function()
-		local url = assetUrl(e.id)
-		if copy(url) then
-			setStatus("dicopy: " .. url)
-		else
-			setStatus("ga ada setclipboard, id: " .. url)
-		end
+	keep(saveB.Activated:Connect(function()
+		task.spawn(function()
+			setStatus("narik keyframe...")
+			local path, err = dumpEntry(e)
+			setStatus(path and ("tersimpan: " .. path) or ("gagal: " .. tostring(err):sub(1, 60)))
+		end)
 	end))
 end
 
-keep(allBtn.Activated:Connect(dumpAll))
+local function refreshList()
+	local counts = { ALL = 0, GUI = 0, DANCE = 0, EMOTE = 0, LAIN = 0 }
+	local view, selN, selInView = {}, 0, 0
+	for _, e in ipairs(order) do
+		if not e.dead then
+			counts.ALL = counts.ALL + 1
+			if e.inGui then
+				counts.GUI = counts.GUI + 1
+				if catOf(e) == "dance" then
+					counts.DANCE = counts.DANCE + 1
+				else
+					counts.EMOTE = counts.EMOTE + 1
+				end
+			else
+				counts.LAIN = counts.LAIN + 1
+			end
+			if e.sel then
+				selN = selN + 1
+			end
+			if inMode(e, filterMode) and matchQuery(e, searchText) then
+				view[#view + 1] = e
+				if e.sel then
+					selInView = selInView + 1
+				end
+			end
+		end
+	end
 
-keep(stopBtn.Activated:Connect(function()
+	local keys = {}
+	for _, e in ipairs(view) do
+		local c = catOf(e)
+		keys[e] = {
+			e.inGui and 0 or 1,
+			(c == "dance") and 1 or ((c == "emote") and 2 or 3),
+			dispName(e):lower(),
+		}
+	end
+	table.sort(view, function(a, b)
+		local ka, kb = keys[a], keys[b]
+		if ka[1] ~= kb[1] then
+			return ka[1] < kb[1]
+		end
+		if ka[2] ~= kb[2] then
+			return ka[2] < kb[2]
+		end
+		if ka[3] ~= kb[3] then
+			return ka[3] < kb[3]
+		end
+		return a.id < b.id
+	end)
+
+	local shown = {}
+	for i, e in ipairs(view) do
+		if i <= CFG.MAX_ROWS then
+			if not e.row then
+				buildRow(e)
+			end
+			e.row.Visible = true
+			e.row.LayoutOrder = i
+			e.refresh()
+			shown[e] = true
+		end
+	end
+	for _, e in ipairs(order) do
+		if e.row and not shown[e] then
+			e.row.Visible = false
+		end
+	end
+	-- buang baris tersembunyi kalau kebanyakan (hemat memori)
+	if builtRows > CFG.MAX_ROWS * 2 + 100 then
+		for _, e in ipairs(order) do
+			if e.row and not shown[e] then
+				pcall(function()
+					e.row:Destroy()
+				end)
+				e.row, e.refresh = nil, nil
+				builtRows = builtRows - 1
+			end
+		end
+	end
+
+	for name, b in pairs(ui.chips) do
+		local label = (name == "ALL") and "SEMUA" or name
+		b.Text = label .. " " .. counts[name]
+		b.BackgroundColor3 = (filterMode == name) and COL.chipOn or COL.chipOff
+	end
+	if selN > 0 then
+		ui.dumpBtn.Text = "DUMP SEL (" .. selN .. ")"
+	else
+		ui.dumpBtn.Text = "DUMP (" .. #view .. ")"
+	end
+	ui.title.Text = ("Anim Dump v2  %d | GUI %d (D %d / E %d)"):format(counts.ALL, counts.GUI, counts.DANCE, counts.EMOTE)
+	ui.learnBtn.Text = CFG.LEARN and "LEARN ON" or "LEARN OFF"
+	ui.learnBtn.BackgroundColor3 = CFG.LEARN and COL.green or COL.grey
+	ui.fmtBtn.Text = "." .. string.upper(CFG.FORMAT == "rbxm" and "rbxm" or "rbxmx")
+	ui.viewSize = #view
+end
+
+local function stopAll()
+	cancelFlag = true
 	if currentTrack then
 		pcall(function()
 			currentTrack:Stop(0.1)
 		end)
-		setStatus("stopped")
 	end
-end))
+	setStatus("stopped / dibatalin")
+end
 
-keep(clrBtn.Activated:Connect(function()
-	for _, c in ipairs(list:GetChildren()) do
-		if c:IsA("Frame") then
-			c:Destroy()
+local function destroy()
+	alive = false
+	for _, c in ipairs(conns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	if currentTrack then
+		pcall(function()
+			currentTrack:Stop(0)
+		end)
+	end
+	if gui then
+		pcall(function()
+			gui:Destroy()
+		end)
+	end
+	if env.AnimRip and env.AnimRip.list == order then
+		env.AnimRip = nil
+	end
+end
+
+local function wireButtons()
+	keep(ui.closeBtn.Activated:Connect(destroy))
+	keep(ui.scanBtn.Activated:Connect(rescan))
+	keep(ui.autoBtn.Activated:Connect(autoClick))
+	keep(ui.stopBtn.Activated:Connect(stopAll))
+	keep(ui.learnBtn.Activated:Connect(function()
+		CFG.LEARN = not CFG.LEARN
+		markDirty()
+	end))
+	keep(ui.fmtBtn.Activated:Connect(function()
+		CFG.FORMAT = (CFG.FORMAT == "rbxm") and "rbxmx" or "rbxm"
+		setStatus("format output: ." .. CFG.FORMAT)
+		markDirty()
+	end))
+	keep(ui.search:GetPropertyChangedSignal("Text"):Connect(function()
+		searchText = trim(ui.search.Text):lower()
+		markDirty()
+	end))
+	keep(ui.selBtn.Activated:Connect(function()
+		for _, e in ipairs(currentView()) do
+			e.sel = true
+			if e.refresh then
+				e.refresh()
+			end
 		end
-	end
-	setStatus("list GUI dibersihin (data tetap ada, DUMP ALL masih lengkap)")
-end))
+		markDirty()
+	end))
+	keep(ui.clrBtn.Activated:Connect(function()
+		for _, e in ipairs(order) do
+			e.sel = nil
+			if e.refresh then
+				e.refresh()
+			end
+		end
+		markDirty()
+	end))
+	keep(ui.dumpBtn.Activated:Connect(function()
+		local list, label = dumpTargets()
+		task.spawn(dumpEntries, list, label)
+	end))
+	keep(ui.allBtn.Activated:Connect(function()
+		task.spawn(dumpAll)
+	end))
+end
 
 ----------------------------------------------------------------
--- Jalanin scanner
+-- Jalanin
 ----------------------------------------------------------------
+buildGui()
+wireButtons()
+
 task.spawn(function()
+	playerGui = lp:FindFirstChildOfClass("PlayerGui") or lp:WaitForChild("PlayerGui", 15)
 	local n = 0
 	for _, d in ipairs(game:GetDescendants()) do
 		pcall(onInstance, d)
@@ -441,12 +3082,43 @@ task.spawn(function()
 			end)
 		end
 	end
+	rescan()
 end)
 
 keep(game.DescendantAdded:Connect(function(d)
 	pcall(onInstance, d)
 end))
 
+keep(lp.CharacterAdded:Connect(function()
+	task.delay(2, function()
+		if alive then
+			pcall(scanNative)
+		end
+	end)
+end))
+
+-- worker analisis tombol GUI
+task.spawn(function()
+	while alive do
+		local n = 0
+		workerBusy = #btnQueue > 0
+		while alive and #btnQueue > 0 and n < 20 do
+			local btn = table.remove(btnQueue)
+			queuedBtn[btn] = nil
+			if btn.Parent and not isOwnGui(btn) then
+				local ok, err = pcall(analyzeButton, btn)
+				if not ok then
+					log("analyze error:", tostring(err))
+				end
+			end
+			n = n + 1
+		end
+		workerBusy = #btnQueue > 0
+		task.wait(n > 0 and 0.05 or 0.3)
+	end
+end)
+
+-- safety net: animasi yang lagi diputar (server-side / belum ke-hook)
 task.spawn(function()
 	while alive do
 		for animator in pairs(animators) do
@@ -455,43 +3127,86 @@ task.spawn(function()
 			else
 				pcall(function()
 					for _, tr in ipairs(animator:GetPlayingAnimationTracks()) do
-						local anim = tr.Animation
-						if anim then
-							add(anim.AnimationId, tr.Name, "playing@" .. safeFullName(animator))
-						end
+						onTrack(animator, tr, false)
 					end
 				end)
 			end
 		end
-		task.wait(POLL_INTERVAL)
+		task.wait(CFG.POLL_INTERVAL)
 	end
 end)
 
-----------------------------------------------------------------
--- Cleanup + API
-----------------------------------------------------------------
-local function destroy()
-	alive = false
-	for _, c in ipairs(conns) do
-		pcall(function()
-			c:Disconnect()
-		end)
+-- render UI (debounce)
+task.spawn(function()
+	while alive do
+		if dirty then
+			dirty = false
+			local ok, err = pcall(refreshList)
+			if not ok then
+				log("ui error:", tostring(err))
+			end
+		end
+		task.wait(0.25)
 	end
-	if currentTrack then
-		pcall(function()
-			currentTrack:Stop(0)
-		end)
-	end
-	gui:Destroy()
-end
-
-keep(closeBtn.Activated:Connect(destroy))
+end)
 
 env.AnimRip = {
+	dump = dump,
 	dumpAll = dumpAll,
-	ids = ids,
+	dumpGui = function()
+		return dumpEntries(entriesFor("GUI"), "GUI")
+	end,
+	dumpDance = function()
+		return dumpEntries(entriesFor("DANCE"), "DANCE")
+	end,
+	dumpEmote = function()
+		return dumpEntries(entriesFor("EMOTE"), "EMOTE")
+	end,
+	dumpSelected = function()
+		return dumpEntries(selectedEntries(), "SELECTED")
+	end,
+	scan = rescan,
+	auto = autoClick,
+	setFilter = function(mode)
+		filterMode = tostring(mode or "ALL"):upper()
+		markDirty()
+	end,
+	setFormat = function(fmt)
+		CFG.FORMAT = (tostring(fmt):lower() == "rbxm") and "rbxm" or "rbxmx"
+		markDirty()
+	end,
+	name = function(rawId)
+		local id = parseId(rawId)
+		if not id then
+			return nil, "id ga valid"
+		end
+		return resolveName(found[id] or { id = id, name = "?", source = "manual", catLv = 0 })
+	end,
+	assetId = function(rawId)
+		local id = parseId(rawId)
+		return id and assetUrl(id) or nil
+	end,
+	entries = function()
+		local r = {}
+		for _, e in ipairs(order) do
+			if not e.dead then
+				r[#r + 1] = {
+					id = e.id,
+					assetId = assetUrl(e.id),
+					name = dispName(e),
+					source = e.source,
+					category = catOf(e),
+					inGui = e.inGui == true,
+					slot = e.slot,
+				}
+			end
+		end
+		return r
+	end,
 	list = order,
+	toXML = toXML,
+	config = CFG,
 	destroy = destroy,
 }
 
-print("[AnimRip] jalan. Tekan COPY di baris animasi, atau DUMP ALL buat simpan semua ID.")
+print("[AnimRip v2] jalan. Pilih filter GUI / DANCE / EMOTE, centang yang mau, lalu DUMP. AUTO = klik otomatis emote GUI.")
